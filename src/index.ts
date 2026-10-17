@@ -14,23 +14,55 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const allowedOrigins = new Set(
-  [process.env.ALLOWED_ORIGINS, process.env.FRONTEND_URL]
-    .filter(Boolean)
-    .flatMap(value => String(value).split(',').map(origin => origin.trim()))
-    .filter(Boolean)
-);
-if (allowedOrigins.size === 0) allowedOrigins.add('http://localhost:5173');
 
-// Security and utility middleware
-app.use(helmet());
-app.use(cors({
+// Collect explicitly configured origins
+const configuredOrigins = [process.env.ALLOWED_ORIGINS, process.env.FRONTEND_URL]
+  .filter(Boolean)
+  .flatMap(value => String(value).split(','))
+  .map(origin => origin.trim().replace(/\/+$/, '').toLowerCase())
+  .filter(Boolean);
+
+const allowedOriginsSet = new Set(configuredOrigins);
+// Default local origins
+allowedOriginsSet.add('http://localhost:5173');
+allowedOriginsSet.add('http://localhost:3000');
+allowedOriginsSet.add('http://127.0.0.1:5173');
+
+function isOriginAllowed(origin?: string): boolean {
+  if (!origin) return true; // non-browser requests (Postman, server-to-server)
+  const clean = origin.trim().replace(/\/+$/, '').toLowerCase();
+  if (allowedOriginsSet.has(clean)) return true;
+  // Automatically allow all Vercel deployments (production, preview, staging)
+  if (/^https:\/\/[a-z0-9_-]+\.vercel\.app$/.test(clean)) return true;
+  // Allow localhost & local network testing
+  if (/^http:\/\/localhost(:\d+)?$/.test(clean)) return true;
+  if (/^http:\/\/127\.0\.0\.1(:\d+)?$/.test(clean)) return true;
+  return false;
+}
+
+const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
-    // Browser origins must match the explicit deployment allowlist. Never use
-    // a wildcard while credentialed cookies are enabled.
-    callback(null, !origin || allowedOrigins.has(origin));
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`[cors] Rejected origin: ${origin}`);
+      callback(null, false);
+    }
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  exposedHeaders: ['Set-Cookie'],
+  optionsSuccessStatus: 204,
+};
+
+// 1. CORS middleware must run before everything else
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// 2. Helmet with crossOriginResourcePolicy allowing cross-origin API calls
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '2mb' }));

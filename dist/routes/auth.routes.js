@@ -17,10 +17,11 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_LIMIT = 10;
 const otpStore = new Map();
 function setSessionCookie(res, token) {
+    const isProd = process.env.NODE_ENV === 'production';
     res.cookie('gradely_session', token, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
+        secure: isProd,
+        sameSite: isProd ? 'none' : 'lax',
         maxAge: 2 * 60 * 60 * 1000,
         path: '/',
     });

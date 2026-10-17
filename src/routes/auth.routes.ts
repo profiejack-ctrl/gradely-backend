@@ -24,10 +24,11 @@ interface OtpEntry {
 const otpStore = new Map<string, OtpEntry>();
 
 function setSessionCookie(res: Response, token: string): void {
+  const isProd = process.env.NODE_ENV === 'production';
   res.cookie('gradely_session', token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
     maxAge: 2 * 60 * 60 * 1000,
     path: '/',
   });
