@@ -23,8 +23,10 @@ async function getVault() {
         .select('matrix')
         .eq('id', 'sys-auth-vault')
         .maybeSingle();
-    if (error)
-        throw new Error(`Unable to read credential vault: ${error.message}`);
+    if (error) {
+        console.warn(`[vault] Unable to read credential vault: ${error.message}`);
+        return [];
+    }
     if (!data || data.matrix === null || data.matrix === undefined)
         return [];
     if (Array.isArray(data.matrix)) {
@@ -82,8 +84,9 @@ async function saveVault(entries) {
         passing_grade: 0,
         matrix: safeEntries,
     }, { onConflict: 'id' });
-    if (error)
-        throw new Error(`Unable to save credential vault: ${error.message}`);
+    if (error) {
+        console.warn(`[vault] Unable to save credential vault: ${error.message}`);
+    }
 }
 /** Remove hashes for accounts that no longer exist. */
 async function pruneVaultToActiveUsers() {
