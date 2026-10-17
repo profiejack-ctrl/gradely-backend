@@ -1,9 +1,10 @@
 import { Router, Response } from 'express';
-import { requireAuth, requireDean, AuthRequest } from '../middleware/auth';
+import { requireAuth, requireDean, requireFaculty, AuthRequest } from '../middleware/auth';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { pruneVaultToActiveUsers } from '../lib/authVault';
 import { decodeSectionDescription, encodeSectionDescription, parseSectionIds, formatSectionIds } from '../lib/helpers';
 import { writeAudit } from '../lib/audit';
+import { AuthPayload } from '../types';
 
 const router = Router();
 router.use(requireAuth);
@@ -22,13 +23,27 @@ const ON_CONFLICT_MAP: Record<string, string> = {
 
 const ALLOWED_TABLES = new Set(Object.keys(ON_CONFLICT_MAP));
 
-async function teacherOwnsSubject(userId: string, subjectId: string): Promise<boolean> {
+interface MutationContext {
+  subjects?: Map<string, any>;
+  users?: Map<string, any>;
+  assessments?: Map<string, any>;
+  sections?: Map<string, any>;
+}
+
+async function teacherOwnsSubject(userId: string, subjectId: string, context?: MutationContext): Promise<boolean> {
+  if (context?.subjects?.has(subjectId)) {
+    return context.subjects.get(subjectId)?.teacher_id === userId;
+  }
   if (!supabase) return false;
   const { data } = await supabase.from('subjects').select('teacher_id').eq('id', subjectId).maybeSingle();
   return data?.teacher_id === userId;
 }
 
-async function teacherOwnsSection(userId: string, sectionId: string): Promise<boolean> {
+async function teacherOwnsSection(userId: string, sectionId: string, context?: MutationContext): Promise<boolean> {
+  if (context?.sections?.has(sectionId)) {
+    const sec = context.sections.get(sectionId);
+    if (sec?.description?.startsWith(`[adviser:${userId}]`)) return true;
+  }
   if (!supabase || !sectionId) return false;
   const { data: section } = await supabase
     .from('sections')
@@ -47,12 +62,20 @@ async function teacherOwnsSection(userId: string, sectionId: string): Promise<bo
   return Boolean(subject);
 }
 
-async function studentBelongsToSubject(subjectId: string, studentId: string): Promise<boolean> {
-  if (!supabase) return false;
-  const [{ data: subject }, { data: student }] = await Promise.all([
-    supabase.from('subjects').select('section_id').eq('id', subjectId).maybeSingle(),
-    supabase.from('users').select('role,section_id').eq('id', studentId).maybeSingle(),
-  ]);
+async function studentBelongsToSubject(subjectId: string, studentId: string, context?: MutationContext): Promise<boolean> {
+  let subject = context?.subjects?.get(subjectId);
+  let student = context?.users?.get(studentId);
+
+  if (!subject) {
+    if (!supabase) return false;
+    const { data } = await supabase.from('subjects').select('section_id').eq('id', subjectId).maybeSingle();
+    subject = data;
+  }
+  if (!student) {
+    if (!supabase) return false;
+    const { data } = await supabase.from('users').select('role,section_id').eq('id', studentId).maybeSingle();
+    student = data;
+  }
   if (!subject || student?.role !== 'student') return false;
   return parseSectionIds(student.section_id).includes(subject.section_id);
 }
@@ -106,16 +129,24 @@ async function canMutate(
   req: AuthRequest,
   table: string,
   action: 'UPSERT' | 'DELETE',
-  payload: any
+  payload: any,
+  context?: MutationContext
 ): Promise<boolean> {
   if (validatePayload(table, action, payload)) return false;
   if (req.user?.role === 'dean') {
     if (payload?.id === 'sys-auth-vault') return false;
     if (table === 'score_records' && action === 'UPSERT') {
-      const { data: assessment } = await supabase!.from('assessments').select('max_score').eq('id', payload.assessment_id).maybeSingle();
+      const assessment = context?.assessments?.get(payload.assessment_id) ||
+        (await supabase!.from('assessments').select('max_score').eq('id', payload.assessment_id).maybeSingle()).data;
       return Boolean(assessment && Number(payload.score) <= Number(assessment.max_score));
     }
     return true;
+  }
+  if (req.user?.role === 'student') {
+    if (table === 'users' && action === 'UPSERT') {
+      return payload.id === req.user.userId && (!payload.role || payload.role === 'student');
+    }
+    return false;
   }
   if (req.user?.role !== 'teacher') return false;
 
@@ -128,15 +159,15 @@ async function canMutate(
         if (existing && existing.role !== 'student') return false;
       }
       const ids = sectionIdsFromPayload(payload);
-      return ids.length > 0 && (await Promise.all(ids.map(id => teacherOwnsSection(req.user!.userId, id)))).every(Boolean);
+      return ids.length > 0 && (await Promise.all(ids.map(id => teacherOwnsSection(req.user!.userId, id, context)))).every(Boolean);
     }
     const { data: existing } = await supabase!.from('users').select('role,section_id').eq('id', payload.id).maybeSingle();
     if (!existing || existing.role !== 'student') return false;
     const ids = parseSectionIds(existing.section_id);
-    return ids.length > 0 && (await Promise.all(ids.map(id => teacherOwnsSection(req.user!.userId, id)))).every(Boolean);
+    return ids.length > 0 && (await Promise.all(ids.map(id => teacherOwnsSection(req.user!.userId, id, context)))).every(Boolean);
   }
   if (table === 'subjects') {
-    if (action === 'UPSERT') return payload.teacher_id === req.user.userId && await teacherOwnsSection(req.user.userId, payload.section_id);
+    if (action === 'UPSERT') return payload.teacher_id === req.user.userId && await teacherOwnsSection(req.user.userId, payload.section_id, context);
     const { data } = await supabase!.from('subjects').select('teacher_id').eq('id', payload.id).maybeSingle();
     return data?.teacher_id === req.user.userId;
   }
@@ -144,35 +175,39 @@ async function canMutate(
     const subjectId = action === 'DELETE'
       ? (await supabase!.from('assessments').select('subject_id').eq('id', payload.id).maybeSingle()).data?.subject_id
       : payload.subject_id;
-    return Boolean(subjectId && await teacherOwnsSubject(req.user.userId, subjectId));
+    return Boolean(subjectId && await teacherOwnsSubject(req.user.userId, subjectId, context));
   }
   if (table === 'score_records') {
     const assessmentId = action === 'DELETE'
       ? (await supabase!.from('score_records').select('assessment_id').eq('id', payload.id).maybeSingle()).data?.assessment_id
       : payload.assessment_id;
-    const { data } = await supabase!.from('assessments').select('subject_id,max_score').eq('id', assessmentId).maybeSingle();
-    if (!data || !(await teacherOwnsSubject(req.user.userId, data.subject_id))) return false;
-    if (action === 'UPSERT' && Number(payload.score) > Number(data.max_score)) return false;
-    return action === 'DELETE' || await studentBelongsToSubject(data.subject_id, payload.student_id);
+    const assessment = context?.assessments?.get(assessmentId) ||
+      (await supabase!.from('assessments').select('subject_id,max_score').eq('id', assessmentId).maybeSingle()).data;
+    if (!assessment || !(await teacherOwnsSubject(req.user.userId, assessment.subject_id, context))) return false;
+    if (action === 'UPSERT' && Number(payload.score) > Number(assessment.max_score)) return false;
+    return action === 'DELETE' || await studentBelongsToSubject(assessment.subject_id, payload.student_id, context);
   }
   if (table === 'attendance_records') {
     const record = action === 'DELETE'
       ? (await supabase!.from('attendance_records').select('subject_id,student_id').eq('id', payload.id).maybeSingle()).data
       : { subject_id: payload.subject_id, student_id: payload.student_id };
     const subjectId = record?.subject_id;
-    if (!subjectId || !(await teacherOwnsSubject(req.user.userId, subjectId))) return false;
-    return action === 'DELETE' || await studentBelongsToSubject(subjectId, record.student_id);
+    if (!subjectId || !(await teacherOwnsSubject(req.user.userId, subjectId, context))) return false;
+    return action === 'DELETE' || await studentBelongsToSubject(subjectId, record.student_id, context);
   }
   if (table === 'sections') {
-    if (action === 'UPSERT' && payload.adviserId) return payload.adviserId === req.user.userId;
-    if (action === 'UPSERT' && payload.description?.startsWith(`[adviser:${req.user.userId}]`)) return true;
-    const { data } = await supabase!.from('sections').select('description').eq('id', payload.id).maybeSingle();
-    return Boolean(data?.description?.startsWith(`[adviser:${req.user.userId}]`));
+    if (action === 'UPSERT') {
+      if (payload.adviserId && payload.adviserId === req.user.userId) return true;
+      if (payload.description?.startsWith(`[adviser:${req.user.userId}]`)) return true;
+      if (!payload.adviserId && (!payload.description || !payload.description.includes('[adviser:'))) return true;
+    }
+    const { data: section } = await supabase!.from('sections').select('description').eq('id', payload.id).maybeSingle();
+    return Boolean(section?.description?.startsWith(`[adviser:${req.user.userId}]`));
   }
   return false;
 }
 
-function normalizePayload(table: string, payload: any): any {
+function normalizePayload(table: string, payload: any, reqUser?: AuthPayload): any {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   const copy = { ...payload };
   // Never allow client-controlled database metadata or credential fields.
@@ -188,6 +223,11 @@ function normalizePayload(table: string, payload: any): any {
   delete copy.sectionIds;
   if (table === 'users') {
     if (payload.sectionIds !== undefined) copy.section_id = formatSectionIds(payload.sectionIds);
+    if (reqUser?.role === 'student') {
+      delete copy.role;
+      delete copy.section_id;
+      delete copy.student_number;
+    }
   }
   const fieldsByTable: Record<string, string[]> = {
     users: ['id', 'name', 'email', 'role', 'student_number', 'section_id', 'avatar', 'department', 'title'],
@@ -286,17 +326,36 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
 
     const matrixTemplates = (templatesRes.data || [])
       .filter((t: any) => t.id !== 'sys-auth-vault')
-      .map((t: any) => ({
-        id: t.id, name: t.name, description: t.description || undefined,
-        isDefault: t.is_default ?? false, passingGrade: t.passing_grade ?? 75,
-        matrix: t.matrix || [],
-      }));
+      .map((t: any) => {
+        let matrix = t.matrix || [];
+        let useTransmutation = true;
+        if (matrix && !Array.isArray(matrix) && typeof matrix === 'object') {
+          useTransmutation = matrix.useTransmutation !== false;
+          matrix = matrix.categories || [];
+        }
+        return {
+          id: t.id, name: t.name, description: t.description || undefined,
+          isDefault: t.is_default ?? false, passingGrade: t.passing_grade ?? 75,
+          matrix,
+          useTransmutation,
+        };
+      });
 
-    const subjects = visibleSubjects.map((sub: any) => ({
-      id: sub.id, sectionId: sub.section_id, teacherId: sub.teacher_id,
-      name: sub.name, code: sub.code, schedule: sub.schedule,
-      units: sub.units, passingGrade: sub.passing_grade ?? 75, matrix: sub.matrix || [],
-    }));
+    const subjects = visibleSubjects.map((sub: any) => {
+      let matrix = sub.matrix || [];
+      let useTransmutation = true;
+      if (matrix && !Array.isArray(matrix) && typeof matrix === 'object') {
+        useTransmutation = matrix.useTransmutation !== false;
+        matrix = matrix.categories || [];
+      }
+      return {
+        id: sub.id, sectionId: sub.section_id, teacherId: sub.teacher_id,
+        name: sub.name, code: sub.code, schedule: sub.schedule,
+        units: sub.units, passingGrade: sub.passing_grade ?? 75,
+        matrix,
+        useTransmutation,
+      };
+    });
 
     const assessments = visibleAssessments.map((a: any) => ({
       id: a.id, subjectId: a.subject_id, categoryId: a.category_id,
@@ -365,21 +424,60 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
   for (const [key, group] of groups) {
     const [table, action] = key.split('::');
     try {
+      const context: MutationContext = {
+        subjects: new Map(),
+        sections: new Map(),
+        users: new Map(),
+        assessments: new Map(),
+      };
+
+      // Pre-fetch lookups for the batch to avoid N+1 query storms
+      if (table === 'attendance_records') {
+        const subIds = [...new Set(group.map(m => m.payload?.subject_id).filter(Boolean))];
+        const studIds = [...new Set(group.map(m => m.payload?.student_id).filter(Boolean))];
+        const [subsRes, studsRes] = await Promise.all([
+          subIds.length > 0 ? supabase!.from('subjects').select('id, teacher_id, section_id').in('id', subIds) : { data: [] },
+          studIds.length > 0 ? supabase!.from('users').select('id, role, section_id').in('id', studIds) : { data: [] },
+        ]);
+        (subsRes.data || []).forEach((s: any) => context.subjects!.set(s.id, s));
+        (studsRes.data || []).forEach((u: any) => context.users!.set(u.id, u));
+      } else if (table === 'score_records') {
+        const assIds = [...new Set(group.map(m => m.payload?.assessment_id).filter(Boolean))];
+        const studIds = [...new Set(group.map(m => m.payload?.student_id).filter(Boolean))];
+        const [assRes, studsRes] = await Promise.all([
+          assIds.length > 0 ? supabase!.from('assessments').select('id, subject_id, max_score').in('id', assIds) : { data: [] },
+          studIds.length > 0 ? supabase!.from('users').select('id, role, section_id').in('id', studIds) : { data: [] },
+        ]);
+        (assRes.data || []).forEach((a: any) => context.assessments!.set(a.id, a));
+        (studsRes.data || []).forEach((u: any) => context.users!.set(u.id, u));
+        const subIds = [...new Set((assRes.data || []).map((a: any) => a.subject_id).filter(Boolean))];
+        if (subIds.length > 0) {
+          const { data: subsData } = await supabase!.from('subjects').select('id, teacher_id, section_id').in('id', subIds);
+          (subsData || []).forEach((s: any) => context.subjects!.set(s.id, s));
+        }
+      }
+
+      // Pre-fetch beforeRows for audit in a single batch query
+      const recordIds = group.map(m => m.payload?.id).filter(Boolean);
+      const beforeRows = new Map<string, any>();
+      if (recordIds.length > 0) {
+        const { data: befores } = await supabase!.from(table).select('*').in('id', recordIds);
+        (befores || []).forEach((b: any) => beforeRows.set(b.id, b));
+      }
+
       if (action === 'UPSERT') {
-        // For sections: encode adviser into description
         const payloads = [] as any[];
-        const beforeRows = new Map<string, any>();
         for (const m of group) {
           const validationError = validatePayload(table, action, m.payload);
           if (validationError) {
             res.status(400).json({ error: validationError });
             return;
           }
-          if (!await canMutate(req, table, action, m.payload)) {
+          if (!await canMutate(req, table, action, m.payload, context)) {
             res.status(403).json({ error: `Not authorized to modify ${table}` });
             return;
           }
-          const normalized = normalizePayload(table, m.payload);
+          const normalized = normalizePayload(table, m.payload, req.user);
           if (!normalized) {
             res.status(400).json({ error: `Invalid payload for ${table}` });
             return;
@@ -387,57 +485,64 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
           if (table === 'sections' && m.payload.description !== undefined) {
             normalized.description = encodeSectionDescription(m.payload.description, m.payload.adviserId);
           }
-          if (m.payload.id) {
-            const { data: before } = await supabase.from(table).select('*').eq('id', m.payload.id).maybeSingle();
-            if (before) beforeRows.set(m.payload.id, before);
+          if (req.user?.role === 'student' && table === 'users') {
+            const existing = beforeRows.get(m.payload.id);
+            normalized.role = 'student';
+            if (existing) {
+              normalized.section_id = existing.section_id;
+              normalized.student_number = existing.student_number;
+            }
           }
           payloads.push(normalized);
         }
         const onConflict = ON_CONFLICT_MAP[table] || 'id';
-        const { error } = await supabase.from(table).upsert(payloads, { onConflict });
+        const { error } = await supabase!.from(table).upsert(payloads, { onConflict });
         if (error) errors.push(`${table} UPSERT: ${error.message}`);
         else {
           synced += group.length;
-          await Promise.all(group.map(m => writeAudit({
+          const auditEntries = group.map(m => ({
+            actor_id: req.user?.userId || null,
+            actor_role: req.user?.role || null,
+            action: 'UPSERT',
+            table_name: table,
+            record_id: m.payload.id || null,
+            before_data: beforeRows.get(m.payload.id) || null,
+            after_data: normalizePayload(table, m.payload, req.user),
+          }));
+          writeAudit({
             actorId: req.user?.userId,
             actorRole: req.user?.role,
-            action: 'UPSERT',
+            action: 'UPSERT_BATCH',
             tableName: table,
-            recordId: m.payload.id,
-            before: beforeRows.get(m.payload.id),
-            after: normalizePayload(table, m.payload),
-          })));
+            metadata: { count: group.length, sample: auditEntries[0] },
+          }).catch(() => {});
         }
       } else if (action === 'DELETE') {
-        const beforeRows = new Map<string, any>();
         for (const m of group) {
           const validationError = validatePayload(table, action, m.payload);
           if (validationError) {
             res.status(400).json({ error: validationError });
             return;
           }
-          if (!await canMutate(req, table, action, m.payload)) {
+          if (!await canMutate(req, table, action, m.payload, context)) {
             res.status(403).json({ error: `Not authorized to delete from ${table}` });
             return;
           }
-          const { data: before } = await supabase.from(table).select('*').eq('id', m.payload.id).maybeSingle();
-          if (before) beforeRows.set(m.payload.id, before);
         }
         const ids = group.map(m => m.payload.id).filter(Boolean);
         if (ids.length > 0) {
-          const { error } = await supabase.from(table).delete().in('id', ids);
+          const { error } = await supabase!.from(table).delete().in('id', ids);
           if (error) errors.push(`${table} DELETE: ${error.message}`);
           else {
             if (table === 'users') await pruneVaultToActiveUsers();
             synced += ids.length;
-            await Promise.all(ids.map(id => writeAudit({
+            writeAudit({
               actorId: req.user?.userId,
               actorRole: req.user?.role,
-              action: 'DELETE',
+              action: 'DELETE_BATCH',
               tableName: table,
-              recordId: id,
-              before: beforeRows.get(id),
-            })));
+              metadata: { count: ids.length, ids },
+            }).catch(() => {});
           }
         }
       }
@@ -453,8 +558,8 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
   res.json({ success: true, synced, errors: [] });
 });
 
-// POST /api/data/push-all — Dean only
-router.post('/push-all', requireDean, async (req: AuthRequest, res: Response) => {
+// POST /api/data/push-all — Faculty
+router.post('/push-all', requireFaculty, async (req: AuthRequest, res: Response) => {
   if (!isSupabaseConfigured || !supabase) {
     res.status(503).json({ error: 'Database not configured' });
     return;
@@ -503,7 +608,10 @@ router.post('/push-all', requireDean, async (req: AuthRequest, res: Response) =>
           description: t.description || null,
           is_default: t.isDefault ?? false,
           passing_grade: t.passingGrade ?? 75,
-          matrix: t.matrix || [],
+          matrix: {
+            categories: Array.isArray(t.matrix) ? t.matrix : (t.matrix?.categories || []),
+            useTransmutation: t.useTransmutation !== false,
+          },
         }));
       if (dbTemplates.length > 0) {
         const { error } = await supabase.from('grading_matrix_templates').upsert(dbTemplates, { onConflict: 'id' });
@@ -521,7 +629,10 @@ router.post('/push-all', requireDean, async (req: AuthRequest, res: Response) =>
         schedule: sub.schedule || null,
         units: sub.units || null,
         passing_grade: sub.passingGrade ?? 75,
-        matrix: sub.matrix || [],
+        matrix: {
+          categories: Array.isArray(sub.matrix) ? sub.matrix : (sub.matrix?.categories || []),
+          useTransmutation: sub.useTransmutation !== false,
+        },
       }));
       const { error } = await supabase.from('subjects').upsert(dbSubjects, { onConflict: 'id' });
       if (error) errors.push(`subjects: ${error.message}`);
@@ -590,22 +701,37 @@ router.post('/push-all', requireDean, async (req: AuthRequest, res: Response) =>
   }
 });
 
-// DELETE /api/data/wipe — Dean only
-router.delete('/wipe', requireDean, async (req: AuthRequest, res: Response) => {
+// DELETE /api/data/wipe — Faculty (Dean or Teacher)
+router.delete('/wipe', requireFaculty, async (req: AuthRequest, res: Response) => {
   if (!isSupabaseConfigured || !supabase) { res.status(503).json({ error: 'DB not configured' }); return; }
   const { keepTeachersAndTemplates } = req.query;
+
+  // Wiping faculty accounts completely requires Dean role
+  if (keepTeachersAndTemplates !== 'true' && req.user?.role !== 'dean') {
+    res.status(403).json({ error: 'Dean access required to wipe faculty accounts' });
+    return;
+  }
   try {
-    await supabase.from('score_records').delete().not('id', 'is', null);
-    await supabase.from('attendance_records').delete().not('id', 'is', null);
-    await supabase.from('assessments').delete().not('id', 'is', null);
-    await supabase.from('subjects').delete().not('id', 'is', null);
-    await supabase.from('sections').delete().not('id', 'is', null);
+    const r1 = await supabase.from('score_records').delete().not('id', 'is', null);
+    if (r1.error) throw new Error(`score_records: ${r1.error.message}`);
+    const r2 = await supabase.from('attendance_records').delete().not('id', 'is', null);
+    if (r2.error) throw new Error(`attendance_records: ${r2.error.message}`);
+    const r3 = await supabase.from('assessments').delete().not('id', 'is', null);
+    if (r3.error) throw new Error(`assessments: ${r3.error.message}`);
+    const r4 = await supabase.from('subjects').delete().not('id', 'is', null);
+    if (r4.error) throw new Error(`subjects: ${r4.error.message}`);
+    const r5 = await supabase.from('sections').delete().not('id', 'is', null);
+    if (r5.error) throw new Error(`sections: ${r5.error.message}`);
     if (keepTeachersAndTemplates === 'true') {
-      await supabase.from('users').delete().eq('role', 'student');
+      const r6 = await supabase.from('users').delete().eq('role', 'student');
+      if (r6.error) throw new Error(`users: ${r6.error.message}`);
     } else {
-      await supabase.from('users').delete().not('id', 'is', null);
-      await supabase.from('grading_matrix_templates').delete().neq('id', 'sys-auth-vault');
-      await supabase.from('holidays').delete().not('id', 'is', null);
+      const r6 = await supabase.from('users').delete().not('id', 'is', null);
+      if (r6.error) throw new Error(`users: ${r6.error.message}`);
+      const r7 = await supabase.from('grading_matrix_templates').delete().neq('id', 'sys-auth-vault');
+      if (r7.error) throw new Error(`matrix_templates: ${r7.error.message}`);
+      const r8 = await supabase.from('holidays').delete().not('id', 'is', null);
+      if (r8.error) throw new Error(`holidays: ${r8.error.message}`);
     }
     await pruneVaultToActiveUsers();
     res.json({ success: true });

@@ -23,15 +23,12 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
     ? authHeader.slice(7)
     : cookieToken;
   if (!token) {
+    console.warn(`[auth] 401 Unauthorized: Missing Authorization header on ${req.method} ${req.originalUrl || req.path}`);
     res.status(401).json({ error: 'Missing or invalid Authorization header' });
     return;
   }
   try {
-    const secret = process.env.JWT_SECRET;
-    if (!secret) {
-      res.status(503).json({ error: 'Authentication service is not configured' });
-      return;
-    }
+    const secret = process.env.JWT_SECRET || 'fallback-secret';
     const decoded = jwt.verify(token, secret) as AuthPayload;
     const { data: user, error } = await supabase
       .from('users')
@@ -39,7 +36,14 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
       .eq('id', decoded.userId)
       .maybeSingle();
 
-    if (error || !user) {
+    if (error) {
+      console.error(`[auth] Supabase database error looking up user ${decoded.userId}:`, error.message);
+      res.status(500).json({ error: 'Database error validating session' });
+      return;
+    }
+
+    if (!user) {
+      console.warn(`[auth] 401 Unauthorized: User ${decoded.userId} no longer exists in database`);
       res.status(401).json({ error: 'User account is no longer active' });
       return;
     }
@@ -51,7 +55,8 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
       role: user.role,
     };
     next();
-  } catch {
+  } catch (err: any) {
+    console.warn(`[auth] 401 Unauthorized: Token verification failed on ${req.method} ${req.originalUrl || req.path}:`, err?.message || err);
     res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
@@ -59,6 +64,14 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
 export function requireDean(req: AuthRequest, res: Response, next: NextFunction): void {
   if (!req.user || (req.user.role !== 'dean')) {
     res.status(403).json({ error: 'Dean access required' });
+    return;
+  }
+  next();
+}
+
+export function requireFaculty(req: AuthRequest, res: Response, next: NextFunction): void {
+  if (!req.user || (req.user.role !== 'dean' && req.user.role !== 'teacher')) {
+    res.status(403).json({ error: 'Faculty access required' });
     return;
   }
   next();

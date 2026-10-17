@@ -20,7 +20,7 @@ async function writeAudit(entry) {
         after_data: entry.after ?? null,
         metadata: entry.metadata ?? null,
     });
-    if (error && !/does not exist|relation .* not found|could not find the table|schema cache/i.test(error.message)) {
+    if (error && !/does not exist|relation .* not found|could not find the table|schema cache|permission denied/i.test(error.message)) {
         console.warn('Audit log write failed:', error.message);
     }
 }

@@ -14,12 +14,22 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const allowedOrigins = new Set(
+  [process.env.ALLOWED_ORIGINS, process.env.FRONTEND_URL]
+    .filter(Boolean)
+    .flatMap(value => String(value).split(',').map(origin => origin.trim()))
+    .filter(Boolean)
+);
+if (allowedOrigins.size === 0) allowedOrigins.add('http://localhost:5173');
 
 // Security and utility middleware
 app.use(helmet());
 app.use(cors({
-  origin: FRONTEND_URL,
+  origin: (origin, callback) => {
+    // Browser origins must match the explicit deployment allowlist. Never use
+    // a wildcard while credentialed cookies are enabled.
+    callback(null, !origin || allowedOrigins.has(origin));
+  },
   credentials: true,
 }));
 app.use(morgan('dev'));
@@ -49,8 +59,8 @@ app.use((req, res) => {
 // Centralized error handler
 app.use(errorHandler);
 
-// Start server
-app.listen(PORT, () => {
+// Start server locally. Vercel invokes the exported Express app.
+if (!process.env.VERCEL) app.listen(PORT, () => {
   console.log(`🚀 SMS Backend running on http://localhost:${PORT}`);
   console.log(`📡 Supabase: ${isSupabaseConfigured ? 'configured' : 'not configured'}`);
 });

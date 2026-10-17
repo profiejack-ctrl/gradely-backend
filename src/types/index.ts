@@ -32,6 +32,7 @@ export interface MatrixSubCategory {
   name: string;
   weight: number;
   description?: string;
+  isTransmutable?: boolean;
 }
 
 export interface MatrixCategory {
@@ -41,6 +42,7 @@ export interface MatrixCategory {
   description?: string;
   color?: string;
   subCategories?: MatrixSubCategory[];
+  isTransmutable?: boolean;
 }
 
 export interface GradingMatrixTemplate {
@@ -50,6 +52,7 @@ export interface GradingMatrixTemplate {
   isDefault?: boolean;
   passingGrade: number;
   matrix: MatrixCategory[];
+  useTransmutation?: boolean;
 }
 
 export interface Subject {
@@ -62,6 +65,7 @@ export interface Subject {
   matrix: MatrixCategory[];
   schedule?: string;
   units?: number;
+  useTransmutation?: boolean;
 }
 
 export interface Assessment {

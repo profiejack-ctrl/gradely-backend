@@ -10,10 +10,12 @@ const supabase_1 = require("../lib/supabase");
 const authVault_1 = require("../lib/authVault");
 const auth_1 = require("../middleware/auth");
 const helpers_1 = require("../lib/helpers");
+const mailer_1 = require("../lib/mailer");
 const router = (0, express_1.Router)();
 const loginAttempts = new Map();
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_LIMIT = 10;
+const otpStore = new Map();
 function setSessionCookie(res, token) {
     res.cookie('gradely_session', token, {
         httpOnly: true,
@@ -45,9 +47,10 @@ router.post('/login', async (req, res) => {
     if (!attempt || attempt.resetAt <= now)
         loginAttempts.set(key, { count: 0, resetAt: now + LOGIN_WINDOW_MS });
     loginAttempts.get(key).count += 1;
-    const { email, password } = req.body;
-    if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
-        res.status(400).json({ error: 'Email and password are required' });
+    const rawIdentifier = (req.body.identifier || req.body.email || '').toString().trim();
+    const password = (req.body.password || '').toString();
+    if (!rawIdentifier || !password) {
+        res.status(400).json({ error: 'Student ID / Email and password are required' });
         return;
     }
     if (!supabase_1.isSupabaseConfigured || !supabase_1.supabase) {
@@ -55,28 +58,75 @@ router.post('/login', async (req, res) => {
         return;
     }
     try {
-        // 1. Find user
-        const { data: userData, error: userErr } = await supabase_1.supabase
-            .from('users')
-            .select('*')
-            .eq('email', email.toLowerCase().trim())
-            .single();
-        if (userErr || !userData) {
-            res.status(401).json({ error: 'Invalid email or password' });
+        // 1. Find user by Student Number, User ID, or Email
+        let userData = null;
+        if (rawIdentifier.includes('@')) {
+            const { data } = await supabase_1.supabase
+                .from('users')
+                .select('*')
+                .ilike('email', rawIdentifier)
+                .maybeSingle();
+            userData = data;
+        }
+        else {
+            // Direct search by student_number or user id
+            const { data } = await supabase_1.supabase
+                .from('users')
+                .select('*')
+                .or(`student_number.eq.${rawIdentifier},id.eq.${rawIdentifier}`)
+                .maybeSingle();
+            userData = data;
+        }
+        // Fallback: search email case-insensitively if not found
+        if (!userData) {
+            const { data } = await supabase_1.supabase
+                .from('users')
+                .select('*')
+                .ilike('email', rawIdentifier)
+                .maybeSingle();
+            userData = data;
+        }
+        if (!userData) {
+            res.status(401).json({ error: 'Invalid Student ID / Email or password' });
             return;
         }
         // 2. Check vault for password
         const vault = await (0, authVault_1.getVault)();
-        const entry = vault.find(v => v.email.toLowerCase() === email.toLowerCase().trim());
+        let entry = vault.find(v => v.userId === userData.id || v.email.toLowerCase() === userData.email.toLowerCase());
+        const isStudent = userData.role === 'student';
+        const studentDefaultPassword = userData.student_number || userData.id;
+        let isAuthenticated = false;
+        let mustChangePassword = entry?.mustChange ?? (isStudent ? true : false);
         if (entry) {
+            // First verify against saved password hash
             const valid = await bcryptjs_1.default.compare(password, entry.passwordHash);
-            if (!valid) {
-                res.status(401).json({ error: 'Invalid email or password' });
-                return;
+            if (valid) {
+                isAuthenticated = true;
+            }
+            else if (isStudent && entry.mustChange && studentDefaultPassword && password === studentDefaultPassword) {
+                // If password is still flagged for initial change, allow student to sign in with default student_id
+                isAuthenticated = true;
             }
         }
-        else {
-            res.status(401).json({ error: 'Account credentials have not been provisioned' });
+        else if (isStudent) {
+            // Student has no vault entry yet -> default credentials: password is student_id
+            if (studentDefaultPassword && password === studentDefaultPassword) {
+                isAuthenticated = true;
+                mustChangePassword = true;
+                // Automatically provision entry in vault with mustChange = true
+                const passwordHash = await bcryptjs_1.default.hash(studentDefaultPassword, 10);
+                entry = {
+                    userId: userData.id,
+                    email: userData.email.toLowerCase(),
+                    passwordHash,
+                    mustChange: true,
+                };
+                vault.push(entry);
+                await (0, authVault_1.saveVault)(vault);
+            }
+        }
+        if (!isAuthenticated) {
+            res.status(401).json({ error: 'Invalid Student ID / Email or password' });
             return;
         }
         const sectionIds = userData.section_id ? userData.section_id.split(',').map((s) => s.trim()).filter(Boolean) : [];
@@ -91,7 +141,7 @@ router.post('/login', async (req, res) => {
             sectionIds,
             title: userData.title || undefined,
             department: userData.department || undefined,
-            mustChangePassword: entry?.mustChange ?? false,
+            mustChangePassword,
         };
         const token = signToken({ userId: user.id, email: user.email, role: user.role, name: user.name });
         loginAttempts.delete(key);
@@ -264,6 +314,166 @@ router.post('/change-password', auth_1.requireAuth, async (req, res) => {
     }
     catch (err) {
         res.status(500).json({ error: 'Failed to update password' });
+    }
+});
+// POST /api/auth/send-email-otp
+router.post('/send-email-otp', auth_1.requireAuth, async (req, res) => {
+    if (!supabase_1.supabase || !req.user) {
+        res.status(503).json({ error: 'Service unavailable' });
+        return;
+    }
+    const { email } = req.body;
+    if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        res.status(400).json({ error: 'Please provide a valid email address.' });
+        return;
+    }
+    const cleanEmail = email.toLowerCase().trim();
+    try {
+        // Ensure email is not already claimed by another active user
+        const { data: existingUser } = await supabase_1.supabase
+            .from('users')
+            .select('id, name')
+            .ilike('email', cleanEmail)
+            .neq('id', req.user.userId)
+            .maybeSingle();
+        if (existingUser) {
+            res.status(409).json({ error: 'This email address is already associated with another account.' });
+            return;
+        }
+        // Generate random 6-digit verification code
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+        otpStore.set(req.user.userId, {
+            email: cleanEmail,
+            code,
+            expiresAt,
+            attempts: 0,
+        });
+        const result = await (0, mailer_1.sendOtpEmail)(cleanEmail, code, req.user.name);
+        res.json({
+            success: true,
+            message: 'Verification code sent successfully.',
+            mode: result.mode,
+            devOtp: process.env.NODE_ENV !== 'production' ? code : undefined,
+        });
+    }
+    catch (err) {
+        console.error('Error in send-email-otp:', err);
+        res.status(500).json({ error: 'Failed to send verification code. Please check server logs.' });
+    }
+});
+// POST /api/auth/complete-student-onboarding
+router.post('/complete-student-onboarding', auth_1.requireAuth, async (req, res) => {
+    if (!supabase_1.supabase || !req.user) {
+        res.status(503).json({ error: 'Service unavailable' });
+        return;
+    }
+    const { newPassword, email, otp } = req.body;
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+        res.status(400).json({ error: 'New password must be at least 8 characters long.' });
+        return;
+    }
+    if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        res.status(400).json({ error: 'Please enter a valid email address.' });
+        return;
+    }
+    if (!otp || typeof otp !== 'string' || otp.trim().length !== 6) {
+        res.status(400).json({ error: 'A 6-digit verification code is required.' });
+        return;
+    }
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanOtp = otp.trim();
+    // Validate OTP code from store
+    const storedOtp = otpStore.get(req.user.userId);
+    if (!storedOtp) {
+        res.status(400).json({ error: 'No active verification code found. Please request a new code.' });
+        return;
+    }
+    if (Date.now() > storedOtp.expiresAt) {
+        otpStore.delete(req.user.userId);
+        res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
+        return;
+    }
+    if (storedOtp.email !== cleanEmail) {
+        res.status(400).json({ error: 'Verification code does not match the email address provided.' });
+        return;
+    }
+    if (storedOtp.code !== cleanOtp) {
+        storedOtp.attempts += 1;
+        if (storedOtp.attempts >= 5) {
+            otpStore.delete(req.user.userId);
+            res.status(400).json({ error: 'Too many incorrect attempts. Please request a new code.' });
+            return;
+        }
+        res.status(400).json({ error: `Incorrect verification code. (${5 - storedOtp.attempts} attempts remaining)` });
+        return;
+    }
+    // OTP successfully verified - consume it
+    otpStore.delete(req.user.userId);
+    try {
+        // 1. Update student's email in Supabase users table
+        const { error: userErr } = await supabase_1.supabase
+            .from('users')
+            .update({ email: cleanEmail })
+            .eq('id', req.user.userId);
+        if (userErr) {
+            res.status(500).json({ error: `Failed to update account email: ${userErr.message}` });
+            return;
+        }
+        // 2. Update vault with new password hash and new email; clear mustChange flag
+        const vault = await (0, authVault_1.getVault)();
+        const hash = await bcryptjs_1.default.hash(newPassword, 10);
+        const existingIdx = vault.findIndex(v => v.userId === req.user.userId);
+        if (existingIdx >= 0) {
+            vault[existingIdx].email = cleanEmail;
+            vault[existingIdx].passwordHash = hash;
+            vault[existingIdx].mustChange = false;
+        }
+        else {
+            vault.push({
+                userId: req.user.userId,
+                email: cleanEmail,
+                passwordHash: hash,
+                mustChange: false,
+            });
+        }
+        await (0, authVault_1.saveVault)(vault);
+        // 3. Fetch fresh user representation
+        const { data: updatedData, error: fetchErr } = await supabase_1.supabase
+            .from('users')
+            .select('*')
+            .eq('id', req.user.userId)
+            .single();
+        if (fetchErr || !updatedData) {
+            res.status(500).json({ error: 'Account activated but failed to refresh user details.' });
+            return;
+        }
+        const sectionIds = updatedData.section_id ? updatedData.section_id.split(',').map((s) => s.trim()).filter(Boolean) : [];
+        const updatedUser = {
+            id: updatedData.id,
+            name: updatedData.name,
+            email: updatedData.email,
+            role: updatedData.role,
+            avatar: updatedData.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(updatedData.name)}`,
+            studentNumber: updatedData.student_number || undefined,
+            sectionId: sectionIds[0] || undefined,
+            sectionIds,
+            title: updatedData.title || undefined,
+            department: updatedData.department || undefined,
+            mustChangePassword: false,
+        };
+        const token = signToken({
+            userId: updatedUser.id,
+            email: updatedUser.email,
+            role: updatedUser.role,
+            name: updatedUser.name,
+        });
+        setSessionCookie(res, token);
+        res.json({ success: true, user: updatedUser, token });
+    }
+    catch (err) {
+        console.error('Error in complete-student-onboarding:', err);
+        res.status(500).json({ error: 'Failed to complete account activation.' });
     }
 });
 router.post('/logout', (_req, res) => {

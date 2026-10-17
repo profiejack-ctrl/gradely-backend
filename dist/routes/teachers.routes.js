@@ -48,7 +48,9 @@ router.post('/:id/reset-password', async (req, res) => {
                 return;
             }
         }
-        const temporaryPassword = crypto_1.default.randomBytes(9).toString('base64url');
+        const temporaryPassword = target.role === 'student'
+            ? (target.student_number || target.id)
+            : crypto_1.default.randomBytes(9).toString('base64url');
         const passwordHash = await bcryptjs_1.default.hash(temporaryPassword, 12);
         const vault = await (0, authVault_1.getVault)();
         const existingIndex = vault.findIndex(entry => entry.userId === target.id);

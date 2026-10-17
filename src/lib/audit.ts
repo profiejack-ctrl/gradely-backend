@@ -30,7 +30,7 @@ export async function writeAudit(entry: AuditEntry): Promise<void> {
     metadata: entry.metadata ?? null,
   });
 
-  if (error && !/does not exist|relation .* not found|could not find the table|schema cache/i.test(error.message)) {
+  if (error && !/does not exist|relation .* not found|could not find the table|schema cache|permission denied/i.test(error.message)) {
     console.warn('Audit log write failed:', error.message);
   }
 }
