@@ -262,6 +262,105 @@ function normalizePayload(table: string, payload: any, reqUser?: AuthPayload): a
   return copy;
 }
 
+/**
+ * Imports can be retried after a partial upload. In that case the browser may
+ * generate a new local user id for a student whose email already exists in
+ * Supabase. Reconcile those aliases before grouping mutations so child score
+ * and attendance records reference the real users row.
+ */
+async function reconcileStudentIdentityAliases(
+  mutations: Array<{ table: string; action: 'UPSERT' | 'DELETE'; payload: any }>
+): Promise<void> {
+  if (!supabase) return;
+
+  const userMutations = mutations.filter(
+    mutation => mutation.action === 'UPSERT' && mutation.table === 'users' && mutation.payload?.role === 'student'
+  );
+  const childStudentNumbers = mutations
+    .filter(mutation =>
+      mutation.action === 'UPSERT' &&
+      (mutation.table === 'score_records' || mutation.table === 'attendance_records') &&
+      mutation.payload?.student_number
+    )
+    .map(mutation => String(mutation.payload.student_number).trim())
+    .filter(Boolean);
+  if (userMutations.length === 0 && childStudentNumbers.length === 0) return;
+
+  const emails = [...new Set(userMutations.map(m => m.payload.email).filter(Boolean))];
+  const studentNumbers = [...new Set([
+    ...userMutations.map(m => m.payload.student_number).filter(Boolean),
+    ...childStudentNumbers,
+  ])];
+  const [emailResult, numberResult] = await Promise.all([
+    emails.length > 0
+      ? supabase.from('users').select('id,email,student_number,role,section_id').in('email', emails)
+      : Promise.resolve({ data: [] as any[] }),
+    studentNumbers.length > 0
+      ? supabase.from('users').select('id,email,student_number,role,section_id').in('student_number', studentNumbers)
+      : Promise.resolve({ data: [] as any[] }),
+  ]);
+
+  const existingByEmail = new Map<string, any>();
+  const existingByNumber = new Map<string, any>();
+  (emailResult.data || []).forEach((user: any) => existingByEmail.set(String(user.email).toLowerCase(), user));
+  (numberResult.data || []).forEach((user: any) => existingByNumber.set(String(user.student_number).trim(), user));
+
+  const localByEmail = new Map<string, string>();
+  const localByNumber = new Map<string, string>();
+  const aliases = new Map<string, any>();
+
+  for (const mutation of userMutations) {
+    const payload = mutation.payload;
+    const emailKey = String(payload.email || '').toLowerCase();
+    const numberKey = String(payload.student_number || '').trim();
+    const existing = (numberKey && existingByNumber.get(numberKey)) ||
+      (emailKey && existingByEmail.get(emailKey));
+    const duplicateLocalId = (numberKey && localByNumber.get(numberKey)) ||
+      (emailKey && localByEmail.get(emailKey));
+
+    if (existing?.role === 'student' && existing.id !== payload.id) {
+      aliases.set(payload.id, existing);
+      payload.id = existing.id;
+      const mergedSectionIds = [
+        ...parseSectionIds(existing.section_id),
+        ...sectionIdsFromPayload(payload),
+      ];
+      if (mergedSectionIds.length > 0) payload.section_id = formatSectionIds(mergedSectionIds);
+    } else if (duplicateLocalId && duplicateLocalId !== payload.id) {
+      aliases.set(payload.id, { id: duplicateLocalId });
+      payload.id = duplicateLocalId;
+    }
+
+    if (emailKey) localByEmail.set(emailKey, payload.id);
+    if (numberKey) localByNumber.set(numberKey, payload.id);
+  }
+
+  // Score and attendance mutations can be sent in a later HTTP batch than
+  // their user mutations. Resolve them by student number as well, so a retry
+  // never references the temporary browser-generated user id.
+  for (const mutation of mutations) {
+    if (mutation.table !== 'score_records' && mutation.table !== 'attendance_records') continue;
+    const numberKey = String(mutation.payload?.student_number || '').trim();
+    if (!numberKey) continue;
+    const existing = existingByNumber.get(numberKey);
+    const localId = localByNumber.get(numberKey);
+    if (existing?.role === 'student' && existing.id !== mutation.payload.student_id) {
+      aliases.set(mutation.payload.student_id, existing);
+    } else if (localId && localId !== mutation.payload.student_id) {
+      aliases.set(mutation.payload.student_id, { id: localId });
+    }
+  }
+
+  if (aliases.size === 0) return;
+
+  for (const mutation of mutations) {
+    if (mutation.table === 'score_records' || mutation.table === 'attendance_records') {
+      const alias = aliases.get(mutation.payload?.student_id);
+      if (alias?.id) mutation.payload.student_id = alias.id;
+    }
+  }
+}
+
 // GET /api/data/all
 router.get('/all', async (req: AuthRequest, res: Response) => {
   if (!isSupabaseConfigured || !supabase) {
@@ -423,6 +522,14 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
   }
   if (mutations.some(m => !m || !ALLOWED_TABLES.has(m.table) || !['UPSERT', 'DELETE'].includes(m.action))) {
     res.status(400).json({ error: 'Invalid mutation table or action' });
+    return;
+  }
+
+  try {
+    await reconcileStudentIdentityAliases(mutations);
+  } catch (error: any) {
+    console.error('Student identity reconciliation failed:', error);
+    res.status(500).json({ error: 'Unable to reconcile imported students before syncing.' });
     return;
   }
 
@@ -618,10 +725,21 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
           payloads.push(normalized);
         }
         const onConflict = ON_CONFLICT_MAP[table] || 'id';
-        const { error } = await supabase!.from(table).upsert(payloads, { onConflict });
+        // Identity reconciliation can intentionally map multiple retry rows
+        // to one existing student. Avoid sending duplicate conflict keys in a
+        // single Postgres upsert request.
+        const uniquePayloads = [...new Map(payloads.map(payload => [
+          table === 'score_records'
+            ? `${payload.assessment_id}::${payload.student_id}`
+            : table === 'attendance_records'
+              ? `${payload.subject_id}::${payload.student_id}::${payload.date}`
+              : payload.id,
+          payload,
+        ])).values()];
+        const { error } = await supabase!.from(table).upsert(uniquePayloads, { onConflict });
         if (error) errors.push(`${table} UPSERT: ${error.message}`);
         else {
-          synced += group.length;
+          synced += uniquePayloads.length;
 
           // Cache successfully upserted records into context for downstream relational checks
           if (table === 'sections') {
@@ -648,7 +766,7 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
             actorRole: req.user?.role,
             action: 'UPSERT_BATCH',
             tableName: table,
-            metadata: { count: group.length, sample: auditEntries[0] },
+            metadata: { count: uniquePayloads.length, sample: auditEntries[0] },
           }).catch(() => {});
         }
       } else if (action === 'DELETE') {
@@ -686,7 +804,7 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
   }
 
   if (errors.length > 0) {
-    res.status(422).json({ success: false, synced, errors });
+    res.status(422).json({ success: false, synced, errors, error: errors.join('; ') });
     return;
   }
   res.json({ success: true, synced, errors: [] });
