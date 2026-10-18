@@ -675,7 +675,17 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
         ]);
         (assRes.data || []).forEach((a: any) => context.assessments!.set(a.id, a));
         (studsRes.data || []).forEach((u: any) => context.users!.set(u.id, u));
-        const subIds = [...new Set((assRes.data || []).map((a: any) => a.subject_id).filter(Boolean))]
+        // Assessments may have been created earlier in this same HTTP batch
+        // and already exist only in the shared mutation context. Include both
+        // sources so teacher ownership checks do not fall back to one database
+        // query per score.
+        const assessmentsForGroup = [
+          ...(assRes.data || []),
+          ...[...context.assessments!.entries()]
+            .filter(([id]) => group.some(m => m.payload?.assessment_id === id))
+            .map(([, assessment]) => assessment),
+        ];
+        const subIds = [...new Set(assessmentsForGroup.map((a: any) => a.subject_id).filter(Boolean))]
           .filter(id => !context.subjects!.has(id));
         if (subIds.length > 0) {
           const { data: subsData } = await supabase!.from('subjects').select('id, teacher_id, section_id').in('id', subIds);
