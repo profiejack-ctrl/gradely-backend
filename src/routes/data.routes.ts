@@ -23,6 +23,36 @@ const ON_CONFLICT_MAP: Record<string, string> = {
 
 const ALLOWED_TABLES = new Set(Object.keys(ON_CONFLICT_MAP));
 
+/**
+ * PostgREST/Supabase commonly caps a response at 1,000 rows. The client uses
+ * this endpoint as the authoritative refresh, so a single unpaged select can
+ * make a successful import appear to lose records after refresh. Read each
+ * table in stable-sized pages instead.
+ */
+async function fetchAllRows(table: string, columns: string, pageSize = 1000): Promise<any[]> {
+  if (!supabase) return [];
+
+  const rows: any[] = [];
+  let offset = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from(table)
+      .select(columns)
+      .order('id', { ascending: true })
+      .range(offset, offset + pageSize - 1);
+
+    if (error) throw error;
+    const page = data || [];
+    rows.push(...page);
+
+    if (page.length < pageSize) break;
+    offset += pageSize;
+  }
+
+  return rows;
+}
+
 interface MutationContext {
   subjects?: Map<string, any>;
   users?: Map<string, any>;
@@ -369,25 +399,31 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
   }
   try {
     const [
-      usersRes, sectionsRes, templatesRes, subjectsRes,
-      assessmentsRes, scoresRes, attendanceRes, holidaysRes,
+      rawUsers,
+      rawSections,
+      rawTemplates,
+      rawSubjects,
+      rawAssessments,
+      rawScores,
+      rawAttendance,
+      rawHolidays,
     ] = await Promise.all([
-      supabase.from('users').select('id,name,email,role,student_number,section_id,avatar,department,title'),
-      supabase.from('sections').select('id,name,grade_level_or_year,academic_year,semester,room,description'),
-      supabase.from('grading_matrix_templates').select('id,name,description,is_default,passing_grade,matrix'),
-      supabase.from('subjects').select('id,section_id,teacher_id,name,code,schedule,units,passing_grade,matrix'),
-      supabase.from('assessments').select('id,subject_id,category_id,parent_category_id,period,title,max_score,date,due_date,description'),
-      supabase.from('score_records').select('id,assessment_id,student_id,score,remarks,submitted_at'),
-      supabase.from('attendance_records').select('id,subject_id,student_id,date,period,status,note'),
-      supabase.from('holidays').select('id,date,title,type,description'),
+      fetchAllRows('users', 'id,name,email,role,student_number,section_id,avatar,department,title'),
+      fetchAllRows('sections', 'id,name,grade_level_or_year,academic_year,semester,room,description'),
+      fetchAllRows('grading_matrix_templates', 'id,name,description,is_default,passing_grade,matrix'),
+      fetchAllRows('subjects', 'id,section_id,teacher_id,name,code,schedule,units,passing_grade,matrix'),
+      fetchAllRows('assessments', 'id,subject_id,category_id,parent_category_id,period,title,max_score,date,due_date,description'),
+      fetchAllRows('score_records', 'id,assessment_id,student_id,score,remarks,submitted_at'),
+      fetchAllRows('attendance_records', 'id,subject_id,student_id,date,period,status,note'),
+      fetchAllRows('holidays', 'id,date,title,type,description'),
     ]);
 
-    let visibleUsers = usersRes.data || [];
-    let visibleSections = sectionsRes.data || [];
-    let visibleSubjects = subjectsRes.data || [];
-    let visibleAssessments = assessmentsRes.data || [];
-    let visibleScores = scoresRes.data || [];
-    let visibleAttendance = attendanceRes.data || [];
+    let visibleUsers = rawUsers;
+    let visibleSections = rawSections;
+    let visibleSubjects = rawSubjects;
+    let visibleAssessments = rawAssessments;
+    let visibleScores = rawScores;
+    let visibleAttendance = rawAttendance;
 
     if (req.user?.role === 'teacher') {
       const teacherSectionIds = new Set(
@@ -419,7 +455,7 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       visibleAttendance = visibleAttendance.filter((a: any) => a.student_id === req.user!.userId && subjectIds.has(a.subject_id));
     }
 
-    const users = visibleUsers.map((u: any) => {
+    const mappedUsers = visibleUsers.map((u: any) => {
       const sectionIds = parseSectionIds(u.section_id);
       return {
         id: u.id, name: u.name, email: u.email, role: u.role,
@@ -430,7 +466,7 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       };
     });
 
-    const sections = visibleSections.map((s: any) => {
+    const mappedSections = visibleSections.map((s: any) => {
       const { description, adviserId } = decodeSectionDescription(s.description);
       return {
         id: s.id, name: s.name, gradeLevelOrYear: s.grade_level_or_year,
@@ -439,7 +475,7 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       };
     });
 
-    const matrixTemplates = (templatesRes.data || [])
+    const matrixTemplates = rawTemplates
       .filter((t: any) => t.id !== 'sys-auth-vault')
       .map((t: any) => {
         let matrix = t.matrix || [];
@@ -456,7 +492,7 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
         };
       });
 
-    const subjects = visibleSubjects.map((sub: any) => {
+    const mappedSubjects = visibleSubjects.map((sub: any) => {
       let matrix = sub.matrix || [];
       let useTransmutation = true;
       if (matrix && !Array.isArray(matrix) && typeof matrix === 'object') {
@@ -472,29 +508,29 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       };
     });
 
-    const assessments = visibleAssessments.map((a: any) => ({
+    const mappedAssessments = visibleAssessments.map((a: any) => ({
       id: a.id, subjectId: a.subject_id, categoryId: a.category_id,
       parentCategoryId: a.parent_category_id || undefined,
       period: a.period || 'prelim', title: a.title, maxScore: a.max_score,
       date: a.date, dueDate: a.due_date || undefined, description: a.description || undefined,
     }));
 
-    const scores = visibleScores.map((s: any) => ({
+    const mappedScores = visibleScores.map((s: any) => ({
       id: s.id, assessmentId: s.assessment_id, studentId: s.student_id,
       score: s.score, remarks: s.remarks || undefined, submittedAt: s.submitted_at,
     }));
 
-    const attendance = visibleAttendance.map((a: any) => ({
+    const mappedAttendance = visibleAttendance.map((a: any) => ({
       id: a.id, subjectId: a.subject_id, studentId: a.student_id,
       date: a.date, period: a.period, status: a.status, note: a.note || undefined,
     }));
 
-    const holidays = (holidaysRes.data || []).map((h: any) => ({
+    const mappedHolidays = rawHolidays.map((h: any) => ({
       id: h.id, date: h.date, title: h.title, type: h.type,
       description: h.description || undefined,
     }));
 
-    res.json({ users, sections, subjects, assessments, scores, attendance, matrixTemplates, holidays });
+    res.json({ users: mappedUsers, sections: mappedSections, subjects: mappedSubjects, assessments: mappedAssessments, scores: mappedScores, attendance: mappedAttendance, matrixTemplates, holidays: mappedHolidays });
   } catch (err) {
     console.error('Failed to load all data:', err);
     res.status(500).json({ error: 'Failed to load data' });
