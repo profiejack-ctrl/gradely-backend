@@ -3,19 +3,51 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getSmtpConfig = getSmtpConfig;
 exports.sendOtpEmail = sendOtpEmail;
 const nodemailer_1 = __importDefault(require("nodemailer"));
+function getSmtpConfig() {
+    const user = (process.env.SMTP_USER ||
+        process.env.GMAIL_USER ||
+        process.env.EMAIL_USER ||
+        process.env.MAIL_USER ||
+        process.env.GMAIL_EMAIL ||
+        process.env.EMAIL ||
+        '').trim();
+    const rawPass = (process.env.SMTP_PASS ||
+        process.env.SMTP_PASSWORD ||
+        process.env.GMAIL_PASS ||
+        process.env.GMAIL_PASSWORD ||
+        process.env.GMAIL_APP_PASSWORD ||
+        process.env.EMAIL_PASS ||
+        process.env.EMAIL_PASSWORD ||
+        process.env.PASSWORD ||
+        '').trim();
+    // Strip spaces if user pasted a Google App Password (e.g. "abcd efgh ijkl mnop")
+    const pass = rawPass.replace(/\s+/g, '');
+    const host = (process.env.SMTP_HOST ||
+        (user.includes('@gmail.com') ? 'smtp.gmail.com' : 'smtp.gmail.com')).trim();
+    const port = Number(process.env.SMTP_PORT) || 465;
+    const isSecure = process.env.SMTP_SECURE === 'true' || port === 465;
+    const fromAddress = process.env.SMTP_FROM || `"Gradely SMS" <${user || 'no-reply@gradely.edu'}>`;
+    const isConfigured = Boolean(user && pass);
+    return {
+        user,
+        pass,
+        host,
+        port,
+        isSecure,
+        fromAddress,
+        isConfigured,
+    };
+}
 /**
  * Sends a 6-digit OTP verification code to a student's email address.
  * If SMTP credentials are configured in .env, sends via real SMTP (e.g. Gmail/SendGrid).
  * If SMTP is not yet configured, logs clearly to the backend console so local testing succeeds immediately.
  */
 async function sendOtpEmail(toEmail, otpCode, studentName) {
-    const smtpUser = process.env.SMTP_USER;
-    const smtpPass = process.env.SMTP_PASS;
-    const smtpHost = process.env.SMTP_HOST || (smtpUser && smtpUser.includes('@gmail.com') ? 'smtp.gmail.com' : undefined);
-    const smtpPort = Number(process.env.SMTP_PORT) || (process.env.SMTP_SECURE === 'true' ? 465 : 587);
-    const fromAddress = process.env.SMTP_FROM || smtpUser || 'Gradely SMS <no-reply@gradely.edu>';
+    const config = getSmtpConfig();
     const subject = `Your Gradely Verification Code: ${otpCode}`;
     const html = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 540px; margin: 0 auto; padding: 32px 24px; background-color: #f8fafc; color: #1e293b; border-radius: 16px;">
@@ -51,25 +83,34 @@ async function sendOtpEmail(toEmail, otpCode, studentName) {
     </div>
   `;
     const text = `Gradely Student Portal Verification Code: ${otpCode}\n\nHello ${studentName || 'Student'},\n\nUse this 6-digit code to verify your email address: ${otpCode}\n\nThis code expires in 10 minutes.`;
-    if (smtpUser && smtpPass && smtpHost) {
+    if (config.isConfigured) {
         try {
-            const transporter = nodemailer_1.default.createTransport({
-                host: smtpHost,
-                port: smtpPort,
-                secure: smtpPort === 465 || process.env.SMTP_SECURE === 'true',
-                auth: {
-                    user: smtpUser,
-                    pass: smtpPass,
-                },
-            });
+            const isGmail = config.host.includes('gmail') || config.user.includes('@gmail.com');
+            const transporter = isGmail
+                ? nodemailer_1.default.createTransport({
+                    service: 'gmail',
+                    auth: {
+                        user: config.user,
+                        pass: config.pass,
+                    },
+                })
+                : nodemailer_1.default.createTransport({
+                    host: config.host,
+                    port: config.port,
+                    secure: config.isSecure,
+                    auth: {
+                        user: config.user,
+                        pass: config.pass,
+                    },
+                });
             await transporter.sendMail({
-                from: fromAddress,
+                from: config.fromAddress,
                 to: toEmail,
                 subject,
                 text,
                 html,
             });
-            console.log(`[mailer] OTP email successfully sent to ${toEmail}`);
+            console.log(`[mailer] OTP email successfully sent to ${toEmail} via ${isGmail ? 'Gmail' : config.host}`);
             return { delivered: true, mode: 'smtp' };
         }
         catch (err) {
@@ -93,7 +134,7 @@ Reason: ${err.message}
 To:      ${toEmail}
 Student: ${studentName || 'Student'}
 Code:    ${otpCode} (Valid for 10 minutes)
-Note:    Configure SMTP_USER, SMTP_PASS, SMTP_HOST in backend/.env for live delivery
+Note:    Configure SMTP_USER & SMTP_PASS (or GMAIL_USER & GMAIL_PASS) in .env for live delivery
 ======================================================================
   `);
     return { delivered: true, mode: 'simulated' };
