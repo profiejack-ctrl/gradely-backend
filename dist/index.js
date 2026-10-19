@@ -12,8 +12,11 @@ const auth_routes_1 = __importDefault(require("./routes/auth.routes"));
 const data_routes_1 = __importDefault(require("./routes/data.routes"));
 const teachers_routes_1 = __importDefault(require("./routes/teachers.routes"));
 const audit_routes_1 = __importDefault(require("./routes/audit.routes"));
+const attendance_routes_1 = __importDefault(require("./routes/attendance.routes"));
 const error_1 = require("./middleware/error");
 const supabase_1 = require("./lib/supabase");
+const swagger_ui_express_1 = __importDefault(require("swagger-ui-express"));
+const openapi_1 = require("./docs/openapi");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
@@ -70,6 +73,14 @@ app.use((0, helmet_1.default)({
 app.use((0, morgan_1.default)('dev'));
 app.use(express_1.default.json({ limit: '2mb' }));
 app.use(express_1.default.urlencoded({ extended: true, limit: '2mb' }));
+// API documentation
+app.get('/docs/openapi.json', (_req, res) => {
+    res.json(openapi_1.openapiDocument);
+});
+app.use('/docs', swagger_ui_express_1.default.serve, swagger_ui_express_1.default.setup(openapi_1.openapiDocument, {
+    customSiteTitle: 'Gradely API Documentation',
+    explorer: true,
+}));
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
@@ -81,6 +92,7 @@ app.get('/health', (req, res) => {
 // Mount API routes
 app.use('/api/auth', auth_routes_1.default);
 app.use('/api/data', data_routes_1.default);
+app.use('/api/attendance', attendance_routes_1.default);
 app.use('/api/teachers', teachers_routes_1.default);
 app.use('/api/audit', audit_routes_1.default);
 // 404 handler for unknown routes

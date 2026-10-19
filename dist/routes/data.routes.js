@@ -35,6 +35,7 @@ async function fetchAllRows(table, columns, pageSize = 1000) {
         const { data, error } = await supabase_1.supabase
             .from(table)
             .select(columns)
+            .order('id', { ascending: true })
             .range(offset, offset + pageSize - 1);
         if (error)
             throw error;

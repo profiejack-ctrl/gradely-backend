@@ -61,6 +61,16 @@ npm start
 
 Once started, the backend server will listen at `http://localhost:3001`.
 
+### 5. Swagger API Documentation
+
+Open the interactive API documentation at:
+
+```text
+http://localhost:3001/docs/
+```
+
+The raw OpenAPI document is available at `http://localhost:3001/docs/openapi.json`. Set `PUBLIC_API_URL` in production so the Swagger “Servers” selector uses the deployed API URL.
+
 ---
 
 ## Environment Variables
@@ -100,6 +110,33 @@ Once started, the backend server will listen at `http://localhost:3001`.
 | `POST` | `/api/data/push-all` | Dean Only | Overwrites cloud snapshot with local dataset |
 | `DELETE` | `/api/data/wipe` | Dean Only | Wipes cloud data (supports `keepTeachersAndTemplates=true` query param) |
 
+### Student-ID Attendance Tap-In (`/api/attendance`)
+
+| Method | Endpoint | Access | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/attendance/tap` | Teacher / Dean | Finds a student by `studentNumber` and creates or updates attendance for a subject and date |
+
+Example request:
+
+```json
+{
+  "studentNumber": "250102531",
+  "subjectId": "subj-programming-1",
+  "date": "2026-10-19",
+  "status": "present",
+  "period": "prelim",
+  "note": "ID card tap-in"
+}
+```
+
+Send the JWT returned by `/api/auth/login` as:
+
+```http
+Authorization: Bearer YOUR_JWT_TOKEN
+```
+
+Repeated taps for the same student, subject, and date update the existing record rather than creating duplicates.
+
 ### Faculty & Teacher Management (`/api/teachers`)
 | Method | Endpoint | Access | Description |
 | :--- | :--- | :--- | :--- |
@@ -128,9 +165,12 @@ backend/
     │   ├── auth.ts
     │   └── error.ts
     ├── routes/
+    │   ├── attendance.routes.ts
     │   ├── auth.routes.ts
     │   ├── data.routes.ts
     │   └── teachers.routes.ts
+    ├── docs/
+    │   └── openapi.ts
     └── types/
         └── index.ts
 ```

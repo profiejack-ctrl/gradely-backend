@@ -7,8 +7,11 @@ import authRoutes from './routes/auth.routes';
 import dataRoutes from './routes/data.routes';
 import teachersRoutes from './routes/teachers.routes';
 import auditRoutes from './routes/audit.routes';
+import attendanceRoutes from './routes/attendance.routes';
 import { errorHandler } from './middleware/error';
 import { isSupabaseConfigured } from './lib/supabase';
+import swaggerUi from 'swagger-ui-express';
+import { openapiDocument } from './docs/openapi';
 
 dotenv.config();
 
@@ -68,6 +71,15 @@ app.use(morgan('dev'));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
+// API documentation
+app.get('/docs/openapi.json', (_req, res) => {
+  res.json(openapiDocument);
+});
+app.use('/docs', swaggerUi.serve, swaggerUi.setup(openapiDocument, {
+  customSiteTitle: 'Gradely API Documentation',
+  explorer: true,
+}));
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -80,6 +92,7 @@ app.get('/health', (req, res) => {
 // Mount API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/data', dataRoutes);
+app.use('/api/attendance', attendanceRoutes);
 app.use('/api/teachers', teachersRoutes);
 app.use('/api/audit', auditRoutes);
 
