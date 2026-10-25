@@ -8,6 +8,8 @@ import dataRoutes from './routes/data.routes';
 import teachersRoutes from './routes/teachers.routes';
 import auditRoutes from './routes/audit.routes';
 import attendanceRoutes from './routes/attendance.routes';
+import studentRoutes from './routes/student.routes';
+import facultyRoutes from './routes/faculty.routes';
 import { errorHandler } from './middleware/error';
 import { isSupabaseConfigured } from './lib/supabase';
 import swaggerUi from 'swagger-ui-express';
@@ -16,7 +18,7 @@ import { openapiDocument } from './docs/openapi';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
 // Collect explicitly configured origins
 const configuredOrigins = [process.env.ALLOWED_ORIGINS, process.env.FRONTEND_URL]
@@ -93,6 +95,8 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/data', dataRoutes);
 app.use('/api/attendance', attendanceRoutes);
+app.use('/api/student', studentRoutes);
+app.use('/api/faculty', facultyRoutes);
 app.use('/api/teachers', teachersRoutes);
 app.use('/api/audit', auditRoutes);
 
@@ -105,7 +109,7 @@ app.use((req, res) => {
 app.use(errorHandler);
 
 // Start server locally. Vercel invokes the exported Express app.
-if (!process.env.VERCEL) app.listen(PORT, () => {
+if (!process.env.VERCEL) app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SMS Backend running on http://localhost:${PORT}`);
   console.log(`📡 Supabase: ${isSupabaseConfigured ? 'configured' : 'not configured'}`);
 });

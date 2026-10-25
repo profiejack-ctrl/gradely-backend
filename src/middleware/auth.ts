@@ -76,3 +76,12 @@ export function requireFaculty(req: AuthRequest, res: Response, next: NextFuncti
   }
   next();
 }
+
+/** Restrict a route to the authenticated student's own account. */
+export function requireStudent(req: AuthRequest, res: Response, next: NextFunction): void {
+  if (!req.user || req.user.role !== 'student') {
+    res.status(403).json({ error: 'Student access required' });
+    return;
+  }
+  next();
+}

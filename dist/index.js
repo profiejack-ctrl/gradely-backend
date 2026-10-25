@@ -13,13 +13,15 @@ const data_routes_1 = __importDefault(require("./routes/data.routes"));
 const teachers_routes_1 = __importDefault(require("./routes/teachers.routes"));
 const audit_routes_1 = __importDefault(require("./routes/audit.routes"));
 const attendance_routes_1 = __importDefault(require("./routes/attendance.routes"));
+const student_routes_1 = __importDefault(require("./routes/student.routes"));
+const faculty_routes_1 = __importDefault(require("./routes/faculty.routes"));
 const error_1 = require("./middleware/error");
 const supabase_1 = require("./lib/supabase");
 const swagger_ui_express_1 = __importDefault(require("swagger-ui-express"));
 const openapi_1 = require("./docs/openapi");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT) || 3001;
 // Collect explicitly configured origins
 const configuredOrigins = [process.env.ALLOWED_ORIGINS, process.env.FRONTEND_URL]
     .filter(Boolean)
@@ -93,6 +95,8 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', auth_routes_1.default);
 app.use('/api/data', data_routes_1.default);
 app.use('/api/attendance', attendance_routes_1.default);
+app.use('/api/student', student_routes_1.default);
+app.use('/api/faculty', faculty_routes_1.default);
 app.use('/api/teachers', teachers_routes_1.default);
 app.use('/api/audit', audit_routes_1.default);
 // 404 handler for unknown routes
@@ -103,7 +107,7 @@ app.use((req, res) => {
 app.use(error_1.errorHandler);
 // Start server locally. Vercel invokes the exported Express app.
 if (!process.env.VERCEL)
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
         console.log(`🚀 SMS Backend running on http://localhost:${PORT}`);
         console.log(`📡 Supabase: ${supabase_1.isSupabaseConfigured ? 'configured' : 'not configured'}`);
     });

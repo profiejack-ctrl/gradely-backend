@@ -11,6 +11,7 @@ A production-ready Node.js + Express + TypeScript backend server for the Student
 - **JWT Authentication & RBAC**: HttpOnly cookie sessions with legacy Bearer-token compatibility, supporting `dean`, `teacher`, and `student` roles.
 - **Encrypted Credential Vault**: Bcrypt password hashes safely isolated inside `grading_matrix_templates` system record (`sys-auth-vault`), filtered out of all public APIs.
 - **Batch Sync & Multi-Section Support**: Optimized endpoints for syncing entity mutations with automated parsing and encoding of section IDs and adviser tags.
+- **Separated Student Domain**: Read-only `/api/student/*` endpoints expose only the signed-in student's profile, enrolled subjects, assessments, scores, attendance, and progress counters for a standalone mobile app.
 - **Security & Logging**: Helmet for secure headers, CORS, and Morgan request logging.
 
 ---
@@ -44,6 +45,7 @@ JWT_EXPIRES_IN=7d
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=your-supabase-service-role-key
 FRONTEND_URL=http://localhost:5173
+PUBLIC_API_URL=https://api.example.com
 ```
 
 ### 4. Running the Server
@@ -83,6 +85,7 @@ The raw OpenAPI document is available at `http://localhost:3001/docs/openapi.jso
 | `SUPABASE_URL` | Supabase project URL (`https://<project-ref>.supabase.co`) | None (Required) |
 | `SUPABASE_SERVICE_KEY` | Supabase Service Role Secret Key (Server-side only) | None (Required) |
 | `FRONTEND_URL` | Allowed origin URL for CORS policy | `http://localhost:5173` |
+| `PUBLIC_API_URL` | Public API URL shown in Swagger and used by generated integrations | `https://api.example.com` |
 
 ---
 
@@ -110,6 +113,14 @@ The raw OpenAPI document is available at `http://localhost:3001/docs/openapi.jso
 | `POST` | `/api/data/push-all` | Dean Only | Overwrites cloud snapshot with local dataset |
 | `DELETE` | `/api/data/wipe` | Dean Only | Wipes cloud data (supports `keepTeachersAndTemplates=true` query param) |
 
+The normal portal refresh paths are now role-specific: `/api/faculty/dashboard` for dean/teachers and `/api/student/*` for students. `/api/data/all` remains for legacy recovery/compatibility flows.
+
+### Faculty Portal (`/api/faculty`)
+
+| Method | Endpoint | Access | Description |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/api/faculty/dashboard` | Dean / Teacher | Returns the scoped portal snapshot required by the faculty UI |
+
 ### Student-ID Attendance Tap-In (`/api/attendance`)
 
 | Method | Endpoint | Access | Description |
@@ -136,6 +147,27 @@ Authorization: Bearer YOUR_JWT_TOKEN
 ```
 
 Repeated taps for the same student, subject, and date update the existing record rather than creating duplicates.
+
+### Student Mobile Domain (`/api/student`)
+
+These endpoints are strictly limited to users whose authenticated role is `student`. The student is resolved from the JWT; the mobile app never sends another student's ID to fetch academic records.
+
+| Method | Endpoint | Access | Description |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/api/student/profile` | Student Only | Returns the signed-in student's safe profile and enrolled sections |
+| `GET` | `/api/student/dashboard` | Student Only | Returns the mobile dashboard payload with enrolled subjects and progress counters |
+| `GET` | `/api/student/subjects` | Student Only | Returns lightweight enrolled-subject metadata |
+| `GET` | `/api/student/subjects/:subjectId` | Student Only | Returns one enrolled subject, its assessments with the student's scores, attendance, matrix, and progress data |
+| `GET` | `/api/student/attendance?subjectId=...` | Student Only | Returns the signed-in student's attendance records, optionally filtered by subject |
+
+Recommended mobile flow:
+
+1. `POST /api/auth/login` with the student's student number/email and password.
+2. Store the returned JWT securely on the device.
+3. Call `GET /api/student/dashboard` for the home screen.
+4. Call `GET /api/student/subjects/:subjectId` when the student opens a course.
+
+The student routes are read-only. Do not expose the Supabase service key in the mobile app. The existing `/api/data/*` routes remain for the current web portal and teacher synchronization; the mobile app should use `/api/student/*` instead.
 
 ### Faculty & Teacher Management (`/api/teachers`)
 | Method | Endpoint | Access | Description |
@@ -168,6 +200,7 @@ backend/
     │   ├── attendance.routes.ts
     │   ├── auth.routes.ts
     │   ├── data.routes.ts
+        │   ├── student.routes.ts
     │   └── teachers.routes.ts
     ├── docs/
     │   └── openapi.ts

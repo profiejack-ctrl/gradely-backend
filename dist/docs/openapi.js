@@ -23,6 +23,8 @@ exports.openapiDocument = {
     tags: [
         { name: 'Health' },
         { name: 'Authentication' },
+        { name: 'Student', description: 'Read-only mobile/student application endpoints' },
+        { name: 'Faculty', description: 'Scoped dean/teacher portal data' },
         { name: 'Attendance', description: 'Student-ID tap-in attendance operations' },
         { name: 'Data', description: 'Cloud synchronization and data loading' },
         { name: 'Teachers' },
@@ -87,6 +89,38 @@ exports.openapiDocument = {
                     payload: { type: 'object', additionalProperties: true },
                 },
             },
+            StudentProgress: {
+                type: 'object',
+                properties: {
+                    subjectId: { type: 'string', example: 'subj-programming-1' },
+                    periods: {
+                        type: 'object',
+                        additionalProperties: {
+                            type: 'object',
+                            properties: {
+                                period: { type: 'string', enum: ['prelim', 'midterm', 'finals'] },
+                                assessmentCount: { type: 'integer', example: 4 },
+                                scoredAssessmentCount: { type: 'integer', example: 3 },
+                                scoreCompletionPercent: { type: 'number', example: 75 },
+                                rawScorePercent: { type: 'number', nullable: true, example: 88.5 },
+                                hasRecords: { type: 'boolean', example: true },
+                            },
+                        },
+                    },
+                },
+            },
+            StudentAssessment: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', example: 'assessment-quiz-1' },
+                    categoryId: { type: 'string', example: 'written-works' },
+                    period: { type: 'string', enum: ['prelim', 'midterm', 'finals'] },
+                    title: { type: 'string', example: 'Quiz 1' },
+                    maxScore: { type: 'number', example: 50 },
+                    date: { type: 'string', format: 'date', example: '2026-10-20' },
+                    score: { type: 'object', nullable: true, properties: { value: { type: 'number', example: 45 }, remarks: { type: 'string' } } },
+                },
+            },
         },
     },
     paths: {
@@ -121,6 +155,77 @@ exports.openapiDocument = {
             post: {
                 tags: ['Authentication'], summary: 'Log out and clear the session cookie',
                 responses: { '200': jsonResponse('Logged out', { success: true }) },
+            },
+        },
+        '/api/student/profile': {
+            get: {
+                tags: ['Student'], security: [{ bearerAuth: [] }],
+                summary: 'Get the signed-in student profile',
+                description: 'Student-only endpoint. It never accepts a student ID in the URL; the student is always taken from the JWT.',
+                responses: {
+                    '200': jsonResponse('Student profile', { student: { id: 'stud-abc123', name: 'Santos, Maria', email: 'maria@example.com', role: 'student', studentNumber: '250102531', sectionIds: ['section-bsit-1a'] }, sections: [] }),
+                    '403': { $ref: '#/components/responses/StudentOnly' },
+                },
+            },
+        },
+        '/api/faculty/dashboard': {
+            get: {
+                tags: ['Faculty'], security: [{ bearerAuth: [] }],
+                summary: 'Load the scoped dean/teacher portal snapshot',
+                description: 'Teachers receive only their assigned subjects, sections, rosters, assessments, scores, and attendance. Deans receive the administration snapshot required by the faculty portal.',
+                responses: {
+                    '200': jsonResponse('Faculty dashboard data', { users: [], sections: [], subjects: [], assessments: [], scores: [], attendance: [], matrixTemplates: [], holidays: [] }),
+                    '401': { $ref: '#/components/responses/Unauthorized' },
+                    '403': { $ref: '#/components/responses/Forbidden' },
+                },
+            },
+        },
+        '/api/student/dashboard': {
+            get: {
+                tags: ['Student'], security: [{ bearerAuth: [] }],
+                summary: 'Load the mobile student dashboard',
+                description: 'Returns only the signed-in student, enrolled sections, enrolled subjects, and progress counters. Use this for the initial mobile screen.',
+                responses: {
+                    '200': jsonResponse('Student dashboard', { version: 1, student: { id: 'stud-abc123', name: 'Santos, Maria', role: 'student', studentNumber: '250102531' }, sections: [], subjects: [{ subject: { id: 'subj-programming-1', code: 'CS-301', name: 'Programming 1', units: 3 }, progress: { subjectId: 'subj-programming-1', periods: { prelim: { assessmentCount: 4, scoredAssessmentCount: 3, scoreCompletionPercent: 75, rawScorePercent: 88.5, hasRecords: true } } } }] }),
+                    '401': { $ref: '#/components/responses/Unauthorized' },
+                    '403': { $ref: '#/components/responses/StudentOnly' },
+                },
+            },
+        },
+        '/api/student/subjects': {
+            get: {
+                tags: ['Student'], security: [{ bearerAuth: [] }],
+                summary: 'List the signed-in student enrolled subjects',
+                description: 'Returns lightweight subject metadata. Request a subject detail separately when the student opens a course.',
+                responses: {
+                    '200': jsonResponse('Enrolled subjects', { sections: [], subjects: [{ id: 'subj-programming-1', code: 'CS-301', name: 'Programming 1', units: 3, passingGrade: 75 }] }),
+                    '401': { $ref: '#/components/responses/Unauthorized' },
+                    '403': { $ref: '#/components/responses/StudentOnly' },
+                },
+            },
+        },
+        '/api/student/subjects/{subjectId}': {
+            get: {
+                tags: ['Student'], security: [{ bearerAuth: [] }],
+                summary: 'Load one subject progress detail',
+                description: 'The subject must belong to one of the signed-in student\'s enrolled sections. Assessment scores and attendance are restricted to that student.',
+                parameters: [{ name: 'subjectId', in: 'path', required: true, schema: { type: 'string' }, example: 'subj-programming-1' }],
+                responses: {
+                    '200': jsonResponse('Subject progress detail', { student: { id: 'stud-abc123', name: 'Santos, Maria', role: 'student' }, subject: { id: 'subj-programming-1', code: 'CS-301', name: 'Programming 1' }, assessments: [], attendance: [], progress: { subjectId: 'subj-programming-1', periods: {} } }),
+                    '403': { $ref: '#/components/responses/StudentOnly' },
+                    '404': jsonResponse('Subject not found or not enrolled', { error: 'Subject not found or not enrolled' }),
+                },
+            },
+        },
+        '/api/student/attendance': {
+            get: {
+                tags: ['Student'], security: [{ bearerAuth: [] }],
+                summary: 'List the signed-in student attendance',
+                parameters: [{ name: 'subjectId', in: 'query', required: false, schema: { type: 'string' }, description: 'Optional subject filter' }],
+                responses: {
+                    '200': jsonResponse('Student attendance', { attendance: [{ subjectId: 'subj-programming-1', id: 'att-1', date: '2026-10-19', period: 'prelim', status: 'present' }] }),
+                    '403': { $ref: '#/components/responses/StudentOnly' },
+                },
             },
         },
         '/api/attendance/tap': {
@@ -181,5 +286,6 @@ exports.openapiDocument = {
 exports.openapiDocument.components.responses = {
     Unauthorized: jsonResponse('Authentication required', { error: 'Missing or invalid Authorization header' }),
     Forbidden: jsonResponse('Insufficient permissions', { error: 'Faculty access required' }),
+    StudentOnly: jsonResponse('Student access required', { error: 'Student access required' }),
     BadRequest: jsonResponse('Invalid request', { error: 'Invalid attendance status' }),
 };

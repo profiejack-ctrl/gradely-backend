@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.requireAuth = requireAuth;
 exports.requireDean = requireDean;
 exports.requireFaculty = requireFaculty;
+exports.requireStudent = requireStudent;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const supabase_1 = require("../lib/supabase");
 async function requireAuth(req, res, next) {
@@ -68,6 +69,14 @@ function requireDean(req, res, next) {
 function requireFaculty(req, res, next) {
     if (!req.user || (req.user.role !== 'dean' && req.user.role !== 'teacher')) {
         res.status(403).json({ error: 'Faculty access required' });
+        return;
+    }
+    next();
+}
+/** Restrict a route to the authenticated student's own account. */
+function requireStudent(req, res, next) {
+    if (!req.user || req.user.role !== 'student') {
+        res.status(403).json({ error: 'Student access required' });
         return;
     }
     next();
