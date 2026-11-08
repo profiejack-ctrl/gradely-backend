@@ -1,14 +1,32 @@
 export type UserRole = 'dean' | 'teacher' | 'student';
 export type GradingPeriod = 'prelim' | 'midterm' | 'finals';
 export type AttendanceStatus = 'present' | 'late' | 'absent' | 'excused';
+export type GradeDisplayMode = 'raw_only' | 'transmuted_only' | 'both';
+export type ScheduleMode = 'f2f' | 'online';
+export type DayOfWeek = 'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Sunday';
+
+export interface ScheduleSession {
+  mode: ScheduleMode;
+  day: DayOfWeek;
+  startTime: string; // e.g. "08:00"
+  endTime: string;   // e.g. "10:00"
+  room?: string;     // For F2F
+  meetingUrl?: string; // For Online
+}
 
 export interface User {
   id: string;
   name: string;
+  firstName?: string;
+  lastName?: string;
   email: string;
   role: UserRole;
   avatar: string;
+  profilePicture?: string;
+  studentId?: string;
   studentNumber?: string;
+  address?: string;
+  contactNumber?: string;
   sectionId?: string;
   sectionIds?: string[];
   title?: string;
@@ -43,6 +61,7 @@ export interface MatrixCategory {
   color?: string;
   subCategories?: MatrixSubCategory[];
   isTransmutable?: boolean;
+  isAttendance?: boolean;
 }
 
 export interface GradingMatrixTemplate {
@@ -51,6 +70,7 @@ export interface GradingMatrixTemplate {
   description?: string;
   isDefault?: boolean;
   passingGrade: number;
+  gradeDisplayMode?: GradeDisplayMode;
   matrix: MatrixCategory[];
   useTransmutation?: boolean;
 }
@@ -62,8 +82,11 @@ export interface Subject {
   code: string;
   teacherId: string;
   passingGrade: number;
+  gradingMatrixTemplateId?: string;
+  gradeDisplayMode?: GradeDisplayMode;
+  customMatrix?: MatrixCategory[];
   matrix: MatrixCategory[];
-  schedule?: string;
+  schedule?: ScheduleSession[] | string;
   units?: number;
   useTransmutation?: boolean;
 }
@@ -79,6 +102,7 @@ export interface Assessment {
   date: string;
   dueDate?: string;
   description?: string;
+  isAttendance?: boolean;
 }
 
 export interface ScoreRecord {

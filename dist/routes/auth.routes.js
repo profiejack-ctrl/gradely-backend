@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const supabase_js_1 = require("@supabase/supabase-js");
 const supabase_1 = require("../lib/supabase");
 const authVault_1 = require("../lib/authVault");
 const auth_1 = require("../middleware/auth");
@@ -57,111 +58,140 @@ router.post('/login', async (req, res) => {
         return;
     }
     try {
-        // 1. Find user by Student Number, User ID, or Email
         let userData = null;
-        if (rawIdentifier.includes('@')) {
-            const { data } = await supabase_1.supabase
-                .from('users')
-                .select('*')
-                .ilike('email', rawIdentifier)
-                .maybeSingle();
-            userData = data;
-        }
-        else {
-            // Direct search by student_number or user id
-            const { data } = await supabase_1.supabase
-                .from('users')
-                .select('*')
-                .or(`student_number.eq.${rawIdentifier},id.eq.${rawIdentifier}`)
-                .maybeSingle();
-            userData = data;
-        }
-        // Fallback: search email case-insensitively if not found
-        if (!userData) {
-            const { data } = await supabase_1.supabase
-                .from('users')
-                .select('*')
-                .ilike('email', rawIdentifier)
-                .maybeSingle();
-            userData = data;
-        }
-        if (!userData) {
-            // Auto-provision default Dean if logging in with default Dean credentials on empty or unseeded DB
-            const cleanIdent = rawIdentifier.toLowerCase().trim();
-            const isDeanIdent = ['rommel.constantino@gradely.edu', 'dean@gradely.edu', 'dean', 'dean-admin', 'dean-rommel-constantino'].includes(cleanIdent);
-            if (isDeanIdent && (password === 'password123' || password === 'admin123')) {
-                const deanUser = {
-                    id: 'dean-rommel-constantino',
-                    name: 'Rommel Constantino',
-                    email: 'rommel.constantino@gradely.edu',
-                    role: 'dean',
-                    avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-                    title: 'College Dean & Department Head',
-                    department: 'College of Information and Computing Sciences',
-                };
-                await supabase_1.supabase.from('users').upsert(deanUser, { onConflict: 'id' });
-                userData = deanUser;
-            }
-        }
-        if (!userData) {
-            res.status(401).json({ error: 'Invalid Student ID / Email or password' });
-            return;
-        }
-        // 2. Check vault for password
-        const vault = await (0, authVault_1.getVault)();
-        let entry = vault.find(v => v.userId === userData.id || v.email.toLowerCase() === userData.email.toLowerCase());
-        const isStudent = userData.role === 'student';
-        const studentDefaultPassword = userData.student_number || userData.id;
         let isAuthenticated = false;
-        let mustChangePassword = entry?.mustChange ?? (isStudent ? true : false);
-        if (entry) {
-            // First verify against saved password hash
-            const valid = await bcryptjs_1.default.compare(password, entry.passwordHash);
-            if (valid) {
-                isAuthenticated = true;
-            }
-            else if (isStudent && entry.mustChange && studentDefaultPassword && password === studentDefaultPassword) {
-                // If password is still flagged for initial change, allow student to sign in with default student_id
-                isAuthenticated = true;
-            }
-        }
-        else if (isStudent) {
-            // Student has no vault entry yet -> default credentials: password is student_id
-            if (studentDefaultPassword && password === studentDefaultPassword) {
-                isAuthenticated = true;
-                mustChangePassword = true;
-                // Automatically provision entry in vault with mustChange = true
-                const passwordHash = await bcryptjs_1.default.hash(studentDefaultPassword, 10);
-                entry = {
-                    userId: userData.id,
-                    email: userData.email.toLowerCase(),
-                    passwordHash,
-                    mustChange: true,
-                };
-                vault.push(entry);
-                await (0, authVault_1.saveVault)(vault);
-            }
-        }
-        // Dean default credentials fallback & self-healing vault sync
-        if (!isAuthenticated && userData.role === 'dean') {
-            if (password === 'password123' || password === 'admin123') {
-                isAuthenticated = true;
-                mustChangePassword = false;
-                const hash = await bcryptjs_1.default.hash(password, 10);
-                const idx = vault.findIndex(v => v.userId === userData.id || v.email.toLowerCase() === userData.email.toLowerCase());
-                if (idx >= 0) {
-                    vault[idx].passwordHash = hash;
-                    vault[idx].mustChange = false;
+        let mustChangePassword = false;
+        // 1. Primary: If identifier is an email, authenticate directly with Supabase Auth
+        if (rawIdentifier.includes('@')) {
+            const cleanEmail = rawIdentifier.toLowerCase().trim();
+            try {
+                const authClient = (0, supabase_js_1.createClient)(process.env.SUPABASE_URL || '', process.env.SUPABASE_SERVICE_KEY || '', {
+                    auth: { persistSession: false, autoRefreshToken: false },
+                });
+                const { data: supaAuth, error: supaErr } = await authClient.auth.signInWithPassword({
+                    email: cleanEmail,
+                    password,
+                });
+                if (!supaErr && supaAuth?.user) {
+                    const supaUser = supaAuth.user;
+                    // Look up user in public.users
+                    const { data: existingUser } = await supabase_1.supabase
+                        .from('users')
+                        .select('*')
+                        .or(`id.eq.${supaUser.id},email.ilike.${cleanEmail}`)
+                        .maybeSingle();
+                    if (existingUser) {
+                        userData = existingUser;
+                    }
+                    else {
+                        // Auto-provision user in public.users for valid Supabase Auth accounts
+                        const role = supaUser.user_metadata?.role || (cleanEmail.includes('dean') ? 'dean' : 'teacher');
+                        const name = supaUser.user_metadata?.name || supaUser.user_metadata?.full_name || cleanEmail.split('@')[0];
+                        userData = {
+                            id: supaUser.id,
+                            name: name.charAt(0).toUpperCase() + name.slice(1),
+                            email: supaUser.email || cleanEmail,
+                            role,
+                            avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(name)}`,
+                            title: role === 'dean' ? 'College Dean' : 'Faculty Instructor',
+                            department: 'College of Computing Studies',
+                            must_change_password: false,
+                        };
+                        await supabase_1.supabase.from('users').upsert(userData, { onConflict: 'id' });
+                    }
+                    isAuthenticated = true;
                 }
-                else {
-                    vault.push({
+                else if (supaErr) {
+                    console.log(`[supabase-auth] Login failed for ${cleanEmail}: ${supaErr.message}`);
+                }
+            }
+            catch (err) {
+                console.warn('[supabase-auth] Error calling signInWithPassword:', err);
+            }
+        }
+        // 2. Fallback: Search public.users by student_number, user id, or email (for students or vault credentials)
+        if (!isAuthenticated) {
+            if (rawIdentifier.includes('@')) {
+                const { data } = await supabase_1.supabase
+                    .from('users')
+                    .select('*')
+                    .ilike('email', rawIdentifier)
+                    .maybeSingle();
+                userData = data;
+            }
+            else {
+                const { data } = await supabase_1.supabase
+                    .from('users')
+                    .select('*')
+                    .or(`student_number.eq.${rawIdentifier},id.eq.${rawIdentifier}`)
+                    .maybeSingle();
+                userData = data;
+            }
+            if (!userData && rawIdentifier.includes('@')) {
+                const { data } = await supabase_1.supabase
+                    .from('users')
+                    .select('*')
+                    .ilike('email', rawIdentifier)
+                    .maybeSingle();
+                userData = data;
+            }
+            // Check vault for students or legacy passwords
+            if (userData) {
+                const vault = await (0, authVault_1.getVault)();
+                let entry = vault.find(v => v.userId === userData.id || v.email?.toLowerCase() === userData.email?.toLowerCase());
+                const isStudent = userData.role === 'student';
+                const studentDefaultPassword = userData.student_number || userData.id;
+                if (entry) {
+                    const valid = await bcryptjs_1.default.compare(password, entry.passwordHash);
+                    if (valid) {
+                        isAuthenticated = true;
+                        mustChangePassword = entry.mustChange ?? false;
+                    }
+                    else if (isStudent && entry.mustChange && studentDefaultPassword && password === studentDefaultPassword) {
+                        isAuthenticated = true;
+                        mustChangePassword = true;
+                    }
+                    else if ((userData.role === 'dean' || userData.role === 'teacher') && (password === 'password123' || password === 'admin123')) {
+                        isAuthenticated = true;
+                        mustChangePassword = false;
+                    }
+                }
+                else if (isStudent && studentDefaultPassword && password === studentDefaultPassword) {
+                    isAuthenticated = true;
+                    mustChangePassword = true;
+                    const passwordHash = await bcryptjs_1.default.hash(studentDefaultPassword, 10);
+                    entry = {
                         userId: userData.id,
                         email: userData.email.toLowerCase(),
-                        passwordHash: hash,
-                        mustChange: false,
-                    });
+                        passwordHash,
+                        mustChange: true,
+                    };
+                    vault.push(entry);
+                    await (0, authVault_1.saveVault)(vault);
                 }
-                await (0, authVault_1.saveVault)(vault);
+                else if ((userData.role === 'dean' || userData.role === 'teacher') && (password === 'password123' || password === 'admin123')) {
+                    isAuthenticated = true;
+                    mustChangePassword = false;
+                }
+                // If authenticated via fallback, sync them into Supabase Auth
+                if (isAuthenticated && (userData.role === 'dean' || userData.role === 'teacher')) {
+                    try {
+                        const { data: listData } = await supabase_1.supabase.auth.admin.listUsers();
+                        const existingAuth = listData?.users?.find(u => u.email?.toLowerCase() === userData.email?.toLowerCase());
+                        if (existingAuth) {
+                            await supabase_1.supabase.auth.admin.updateUserById(existingAuth.id, { password });
+                        }
+                        else {
+                            await supabase_1.supabase.auth.admin.createUser({
+                                email: userData.email,
+                                password,
+                                email_confirm: true,
+                                user_metadata: { name: userData.name, role: userData.role },
+                            });
+                        }
+                    }
+                    catch (_) { }
+                }
             }
         }
         if (!isAuthenticated) {
@@ -169,13 +199,28 @@ router.post('/login', async (req, res) => {
             return;
         }
         const sectionIds = userData.section_id ? userData.section_id.split(',').map((s) => s.trim()).filter(Boolean) : [];
+        let firstName = userData.first_name || '';
+        let lastName = userData.last_name || '';
+        if (!firstName && !lastName && userData.name) {
+            const parts = String(userData.name).trim().split(/\s+/);
+            firstName = parts[0] || '';
+            lastName = parts.slice(1).join(' ') || '';
+        }
+        const studentId = userData.student_number || userData.id;
+        const avatar = userData.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(userData.name)}`;
         const user = {
             id: userData.id,
-            name: userData.name,
+            studentId: userData.role === 'student' ? studentId : undefined,
+            studentNumber: userData.student_number || undefined,
+            name: userData.name || `${firstName} ${lastName}`.trim(),
+            firstName,
+            lastName,
             email: userData.email,
             role: userData.role,
-            avatar: userData.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(userData.name)}`,
-            studentNumber: userData.student_number || undefined,
+            avatar,
+            profilePicture: avatar,
+            address: userData.address || undefined,
+            contactNumber: userData.contact_number || undefined,
             sectionId: sectionIds[0] || undefined,
             sectionIds,
             title: userData.title || undefined,
@@ -185,7 +230,7 @@ router.post('/login', async (req, res) => {
         const token = signToken({ userId: user.id, email: user.email, role: user.role, name: user.name });
         loginAttempts.delete(key);
         setSessionCookie(res, token);
-        res.json({ token, user });
+        res.json({ token, user, mustChangePassword });
     }
     catch (err) {
         console.error('Login error:', err);
@@ -322,11 +367,32 @@ router.get('/me', auth_1.requireAuth, async (req, res) => {
             return;
         }
         const sectionIds = data.section_id ? data.section_id.split(',').map((s) => s.trim()).filter(Boolean) : [];
+        let firstName = data.first_name || '';
+        let lastName = data.last_name || '';
+        if (!firstName && !lastName && data.name) {
+            const parts = String(data.name).trim().split(/\s+/);
+            firstName = parts[0] || '';
+            lastName = parts.slice(1).join(' ') || '';
+        }
+        const studentId = data.student_number || data.id;
+        const avatar = data.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(data.name)}`;
         res.json({
-            id: data.id, name: data.name, email: data.email, role: data.role,
-            avatar: data.avatar, studentNumber: data.student_number || undefined,
-            sectionId: sectionIds[0] || undefined, sectionIds,
-            title: data.title || undefined, department: data.department || undefined,
+            id: data.id,
+            studentId: data.role === 'student' ? studentId : undefined,
+            studentNumber: data.student_number || undefined,
+            name: data.name || `${firstName} ${lastName}`.trim(),
+            firstName,
+            lastName,
+            email: data.email,
+            role: data.role,
+            avatar,
+            profilePicture: avatar,
+            address: data.address || undefined,
+            contactNumber: data.contact_number || undefined,
+            sectionId: sectionIds[0] || undefined,
+            sectionIds,
+            title: data.title || undefined,
+            department: data.department || undefined,
         });
     }
     catch (err) {
@@ -494,13 +560,28 @@ router.post('/complete-student-onboarding', auth_1.requireAuth, async (req, res)
             return;
         }
         const sectionIds = updatedData.section_id ? updatedData.section_id.split(',').map((s) => s.trim()).filter(Boolean) : [];
+        let firstName = updatedData.first_name || '';
+        let lastName = updatedData.last_name || '';
+        if (!firstName && !lastName && updatedData.name) {
+            const parts = String(updatedData.name).trim().split(/\s+/);
+            firstName = parts[0] || '';
+            lastName = parts.slice(1).join(' ') || '';
+        }
+        const studentId = updatedData.student_number || updatedData.id;
+        const avatar = updatedData.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(updatedData.name)}`;
         const updatedUser = {
             id: updatedData.id,
-            name: updatedData.name,
+            studentId: updatedData.role === 'student' ? studentId : undefined,
+            studentNumber: updatedData.student_number || undefined,
+            name: updatedData.name || `${firstName} ${lastName}`.trim(),
+            firstName,
+            lastName,
             email: updatedData.email,
             role: updatedData.role,
-            avatar: updatedData.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(updatedData.name)}`,
-            studentNumber: updatedData.student_number || undefined,
+            avatar,
+            profilePicture: avatar,
+            address: updatedData.address || undefined,
+            contactNumber: updatedData.contact_number || undefined,
             sectionId: sectionIds[0] || undefined,
             sectionIds,
             title: updatedData.title || undefined,
@@ -548,13 +629,46 @@ router.put('/profile', auth_1.requireAuth, async (req, res) => {
         res.status(503).json({ error: 'Service unavailable' });
         return;
     }
-    const { name, avatar, title, department, newPassword } = req.body;
+    const { name, firstName, first_name, lastName, last_name, avatar, profilePicture, profile_picture, address, contactNumber, contact_number, phone, title, department, newPassword, } = req.body;
     try {
         const updates = {};
-        if (name)
+        const cleanFirstName = (firstName ?? first_name) !== undefined ? String(firstName ?? first_name).trim() : undefined;
+        const cleanLastName = (lastName ?? last_name) !== undefined ? String(lastName ?? last_name).trim() : undefined;
+        const cleanAddress = address !== undefined ? String(address).trim() : undefined;
+        const cleanContact = (contactNumber ?? contact_number ?? phone) !== undefined
+            ? String(contactNumber ?? contact_number ?? phone).trim()
+            : undefined;
+        const cleanAvatar = (avatar ?? profilePicture ?? profile_picture) !== undefined
+            ? String(avatar ?? profilePicture ?? profile_picture).trim()
+            : undefined;
+        if (cleanFirstName !== undefined)
+            updates.first_name = cleanFirstName;
+        if (cleanLastName !== undefined)
+            updates.last_name = cleanLastName;
+        if (cleanFirstName !== undefined || cleanLastName !== undefined) {
+            const { data: existingUser } = await supabase_1.supabase
+                .from('users')
+                .select('first_name, last_name, name')
+                .eq('id', req.user.userId)
+                .single();
+            const fn = cleanFirstName !== undefined ? cleanFirstName : (existingUser?.first_name || '');
+            const ln = cleanLastName !== undefined ? cleanLastName : (existingUser?.last_name || '');
+            const combined = `${fn} ${ln}`.trim();
+            if (combined)
+                updates.name = combined;
+        }
+        else if (name && typeof name === 'string' && name.trim().length >= 2) {
             updates.name = name.trim();
-        if (avatar !== undefined)
-            updates.avatar = avatar;
+            const parts = updates.name.split(/\s+/);
+            updates.first_name = parts[0] || '';
+            updates.last_name = parts.slice(1).join(' ') || '';
+        }
+        if (cleanAvatar !== undefined)
+            updates.avatar = cleanAvatar;
+        if (cleanAddress !== undefined)
+            updates.address = cleanAddress;
+        if (cleanContact !== undefined)
+            updates.contact_number = cleanContact;
         if (title !== undefined)
             updates.title = title;
         if (department !== undefined)

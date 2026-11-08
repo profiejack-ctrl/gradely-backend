@@ -2,7 +2,8 @@ import { Router, Response } from 'express';
 import { requireAuth, requireDean, requireFaculty, AuthRequest } from '../middleware/auth';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { pruneVaultToActiveUsers } from '../lib/authVault';
-import { decodeSectionDescription, encodeSectionDescription, parseSectionIds, formatSectionIds } from '../lib/helpers';
+import { getCourseCatalog, addCourseToCatalog, deleteCourseFromCatalog } from '../lib/courseCatalog';
+import { decodeSectionDescription, encodeSectionDescription, parseSectionIds, formatSectionIds, parseSchedule } from '../lib/helpers';
 import { writeAudit } from '../lib/audit';
 import { AuthPayload } from '../types';
 
@@ -29,18 +30,20 @@ const ALLOWED_TABLES = new Set(Object.keys(ON_CONFLICT_MAP));
  * make a successful import appear to lose records after refresh. Read each
  * table in stable-sized pages instead.
  */
-async function fetchAllRows(table: string, columns: string, pageSize = 1000): Promise<any[]> {
+async function fetchAllRows(table: string, columns: string, configure?: (query: any) => any, pageSize = 1000): Promise<any[]> {
   if (!supabase) return [];
 
   const rows: any[] = [];
   let offset = 0;
 
   while (true) {
-    const { data, error } = await supabase
+    let query: any = supabase
       .from(table)
       .select(columns)
       .order('id', { ascending: true })
       .range(offset, offset + pageSize - 1);
+    if (configure) query = configure(query);
+    const { data, error } = await query;
 
     if (error) throw error;
     const page = data || [];
@@ -72,6 +75,7 @@ async function teacherOwnsSubject(userId: string, subjectId: string, context?: M
   if (data?.section_id) {
     return await teacherOwnsSection(userId, data.section_id, context);
   }
+
   return false;
 }
 
@@ -179,14 +183,15 @@ async function canMutate(
 ): Promise<boolean> {
   if (validatePayload(table, action, payload)) return false;
   if (req.user?.role === 'dean') {
-    if (payload?.id === 'sys-auth-vault') return false;
+    if (payload?.id === 'sys-auth-vault' || payload?.id === 'sys-course-catalog') return false;
     return true;
   }
   if (req.user?.role === 'student') {
     if (table === 'users' && action === 'UPSERT') {
       return payload.id === req.user.userId && (!payload.role || payload.role === 'student');
     }
-    return false;
+  
+  return false;
   }
   if (req.user?.role !== 'teacher') return false;
 
@@ -224,9 +229,9 @@ async function canMutate(
     return Boolean(subjectId && await teacherOwnsSubject(req.user.userId, subjectId, context));
   }
   if (table === 'score_records') {
-    const assessmentId = action === 'DELETE'
+    const assessmentId = payload.assessment_id || (action === 'DELETE'
       ? (await supabase!.from('score_records').select('assessment_id').eq('id', payload.id).maybeSingle()).data?.assessment_id
-      : payload.assessment_id;
+      : payload.assessment_id);
     const assessment = context?.assessments?.get(assessmentId) ||
       (await supabase!.from('assessments').select('subject_id,max_score').eq('id', assessmentId).maybeSingle()).data;
     if (!assessment) return false;
@@ -250,6 +255,11 @@ async function canMutate(
     const { data: section } = await supabase!.from('sections').select('description').eq('id', payload.id).maybeSingle();
     return Boolean(section?.description?.startsWith(`[adviser:${req.user.userId}]`));
   }
+  if (table === 'grading_matrix_templates') {
+    if (payload.id === 'sys-auth-vault' || payload.id === 'sys-course-catalog') return false;
+    return req.user.role === 'teacher' || req.user.role === 'dean';
+  }
+
   return false;
 }
 
@@ -276,13 +286,13 @@ function normalizePayload(table: string, payload: any, reqUser?: AuthPayload): a
     }
   }
   const fieldsByTable: Record<string, string[]> = {
-    users: ['id', 'name', 'email', 'role', 'student_number', 'section_id', 'avatar', 'department', 'title'],
+    users: ['id', 'name', 'first_name', 'last_name', 'email', 'role', 'student_number', 'section_id', 'avatar', 'department', 'title', 'address', 'contact_number'],
     sections: ['id', 'name', 'grade_level_or_year', 'academic_year', 'semester', 'room', 'description'],
-    subjects: ['id', 'section_id', 'teacher_id', 'name', 'code', 'schedule', 'units', 'passing_grade', 'matrix'],
+    subjects: ['id', 'section_id', 'teacher_id', 'name', 'code', 'schedule', 'units', 'passing_grade', 'matrix', 'grading_matrix_template_id', 'grade_display_mode', 'custom_matrix'],
     assessments: ['id', 'subject_id', 'category_id', 'parent_category_id', 'period', 'title', 'max_score', 'date', 'due_date', 'description'],
     score_records: ['id', 'assessment_id', 'student_id', 'score', 'remarks', 'submitted_at'],
     attendance_records: ['id', 'subject_id', 'student_id', 'date', 'period', 'status', 'note'],
-    grading_matrix_templates: ['id', 'name', 'description', 'is_default', 'passing_grade', 'matrix'],
+    grading_matrix_templates: ['id', 'name', 'description', 'is_default', 'passing_grade', 'matrix', 'grade_display_mode'],
     holidays: ['id', 'date', 'title', 'type', 'description'],
   };
   const allowed = new Set(fieldsByTable[table] || []);
@@ -398,61 +408,167 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
     return;
   }
   try {
-    const [
-      rawUsers,
-      rawSections,
-      rawTemplates,
-      rawSubjects,
-      rawAssessments,
-      rawScores,
-      rawAttendance,
-      rawHolidays,
-    ] = await Promise.all([
-      fetchAllRows('users', 'id,name,email,role,student_number,section_id,avatar,department,title'),
-      fetchAllRows('sections', 'id,name,grade_level_or_year,academic_year,semester,room,description'),
-      fetchAllRows('grading_matrix_templates', 'id,name,description,is_default,passing_grade,matrix'),
-      fetchAllRows('subjects', 'id,section_id,teacher_id,name,code,schedule,units,passing_grade,matrix'),
-      fetchAllRows('assessments', 'id,subject_id,category_id,parent_category_id,period,title,max_score,date,due_date,description'),
-      fetchAllRows('score_records', 'id,assessment_id,student_id,score,remarks,submitted_at'),
-      fetchAllRows('attendance_records', 'id,subject_id,student_id,date,period,status,note'),
-      fetchAllRows('holidays', 'id,date,title,type,description'),
+    const { period, subjectId, sectionId, since, exclude } = req.query as {
+      period?: string;
+      subjectId?: string;
+      sectionId?: string;
+      since?: string;
+      exclude?: string;
+    };
+    const excludeSet = new Set((exclude || '').split(',').map(s => s.trim().toLowerCase()));
+
+    const isDean = req.user?.role === 'dean';
+    const isTeacher = req.user?.role === 'teacher';
+    const isStudent = req.user?.role === 'student';
+
+    const applySince = (q: any) => (since ? q.gte('created_at', since) : q);
+
+    const [rawTemplates, rawHolidays, catalogCourses] = await Promise.all([
+      fetchAllRows('grading_matrix_templates', '*'),
+      fetchAllRows('holidays', '*', applySince),
+      getCourseCatalog(),
     ]);
 
-    let visibleUsers = rawUsers;
-    let visibleSections = rawSections;
-    let visibleSubjects = rawSubjects;
-    let visibleAssessments = rawAssessments;
-    let visibleScores = rawScores;
-    let visibleAttendance = rawAttendance;
+    let visibleUsers: any[] = [];
+    let visibleSections: any[] = [];
+    let visibleSubjects: any[] = [];
+    let visibleAssessments: any[] = [];
+    let visibleScores: any[] = [];
+    let visibleAttendance: any[] = [];
 
-    if (req.user?.role === 'teacher') {
-      const teacherSectionIds = new Set(
-        visibleSections
-          .filter((s: any) => s.description?.startsWith(`[adviser:${req.user!.userId}]`))
-          .map((s: any) => s.id)
+    if (isDean) {
+      const subjectFilter = (q: any) => {
+        let query = applySince(q);
+        if (subjectId) query = query.eq('id', subjectId);
+        if (sectionId) query = query.eq('section_id', sectionId);
+        return query;
+      };
+
+      const assessmentFilter = (q: any) => {
+        let query = applySince(q);
+        if (subjectId) query = query.eq('subject_id', subjectId);
+        if (period) query = query.eq('period', period);
+        return query;
+      };
+
+      [visibleUsers, visibleSections, visibleSubjects, visibleAssessments] = await Promise.all([
+        fetchAllRows('users', 'id,name,email,role,student_number,section_id,avatar,department,title', applySince),
+        fetchAllRows('sections', 'id,name,grade_level_or_year,academic_year,semester,room,description', applySince),
+        fetchAllRows('subjects', '*', subjectFilter),
+        fetchAllRows('assessments', 'id,subject_id,category_id,parent_category_id,period,title,max_score,date,due_date,description', assessmentFilter),
+      ]);
+
+      const assessmentIds = visibleAssessments.map((a: any) => a.id);
+      const filteredSubIds = visibleSubjects.map((s: any) => s.id);
+
+      const scorePromise = !excludeSet.has('scores') && assessmentIds.length > 0
+        ? fetchAllRows('score_records', 'id,assessment_id,student_id,score,remarks,submitted_at', (q: any) => applySince(q).in('assessment_id', assessmentIds))
+        : Promise.resolve([]);
+
+      const attendancePromise = !excludeSet.has('attendance') && filteredSubIds.length > 0
+        ? fetchAllRows('attendance_records', 'id,subject_id,student_id,date,period,status,note', (q: any) => {
+            let query = applySince(q).in('subject_id', filteredSubIds);
+            if (period) query = query.eq('period', period);
+            return query;
+          })
+        : Promise.resolve([]);
+
+      [visibleScores, visibleAttendance] = await Promise.all([scorePromise, attendancePromise]);
+
+    } else if (isTeacher) {
+      visibleSubjects = await fetchAllRows(
+        'subjects',
+        '*',
+        q => {
+          let query = q.eq('teacher_id', req.user!.userId);
+          if (subjectId) query = query.eq('id', subjectId);
+          if (sectionId) query = query.eq('section_id', sectionId);
+          return applySince(query);
+        }
       );
-      visibleSubjects = visibleSubjects.filter((s: any) => s.teacher_id === req.user!.userId);
-      visibleSubjects.forEach((s: any) => teacherSectionIds.add(s.section_id));
-      visibleSections = visibleSections.filter((s: any) => teacherSectionIds.has(s.id));
-      visibleUsers = visibleUsers.filter((u: any) =>
-        u.id === req.user!.userId || parseSectionIds(u.section_id).some(id => teacherSectionIds.has(id))
-      );
-      const subjectIds = new Set(visibleSubjects.map((s: any) => s.id));
-      visibleAssessments = visibleAssessments.filter((a: any) => subjectIds.has(a.subject_id));
-      const assessmentIds = new Set(visibleAssessments.map((a: any) => a.id));
-      visibleScores = visibleScores.filter((s: any) => assessmentIds.has(s.assessment_id));
-      visibleAttendance = visibleAttendance.filter((a: any) => subjectIds.has(a.subject_id));
-    } else if (req.user?.role === 'student') {
-      const currentStudent = visibleUsers.find((u: any) => u.id === req.user!.userId);
-      const studentSectionIds = new Set(parseSectionIds(currentStudent?.section_id));
-      visibleUsers = visibleUsers.filter((u: any) => u.id === req.user!.userId);
-      visibleSections = visibleSections.filter((s: any) => studentSectionIds.has(s.id));
-      visibleSubjects = visibleSubjects.filter((s: any) => studentSectionIds.has(s.section_id));
-      const subjectIds = new Set(visibleSubjects.map((s: any) => s.id));
-      visibleAssessments = visibleAssessments.filter((a: any) => subjectIds.has(a.subject_id));
-      const assessmentIds = new Set(visibleAssessments.map((a: any) => a.id));
-      visibleScores = visibleScores.filter((s: any) => s.student_id === req.user!.userId && assessmentIds.has(s.assessment_id));
-      visibleAttendance = visibleAttendance.filter((a: any) => a.student_id === req.user!.userId && subjectIds.has(a.subject_id));
+      const teacherSubjectIds = visibleSubjects.map(s => s.id);
+      const advisedSections = await fetchAllRows('sections', 'id', q => applySince(q).ilike('description', `%[adviser:${req.user!.userId}]%`));
+      const advisedIds = (advisedSections || []).map((s: any) => s.id);
+      const teacherSectionIds = [...new Set([...visibleSubjects.map(s => s.section_id).filter(Boolean), ...advisedIds])];
+
+      const sectionQuery = teacherSectionIds.length > 0
+        ? fetchAllRows('sections', 'id,name,grade_level_or_year,academic_year,semester,room,description', q => applySince(q).in('id', teacherSectionIds))
+        : Promise.resolve([]);
+
+      const userFilters = [`id.eq.${req.user!.userId}`, ...teacherSectionIds.map(secId => `section_id.ilike.%${secId}%`)].join(',');
+      const userQuery = fetchAllRows('users', 'id,name,email,role,student_number,section_id,avatar,department,title', q => applySince(q).or(userFilters));
+
+      const assessmentQuery = teacherSubjectIds.length > 0
+        ? fetchAllRows('assessments', 'id,subject_id,category_id,parent_category_id,period,title,max_score,date,due_date,description', q => {
+            let query = q.in('subject_id', teacherSubjectIds);
+            if (period) query = query.eq('period', period);
+            return applySince(query);
+          })
+        : Promise.resolve([]);
+
+      [visibleSections, visibleUsers, visibleAssessments] = await Promise.all([sectionQuery, userQuery, assessmentQuery]);
+      const assessmentIds = visibleAssessments.map(a => a.id);
+
+      const scorePromise = !excludeSet.has('scores') && assessmentIds.length > 0
+        ? fetchAllRows('score_records', 'id,assessment_id,student_id,score,remarks,submitted_at', q => applySince(q).in('assessment_id', assessmentIds))
+        : Promise.resolve([]);
+
+      const attendancePromise = !excludeSet.has('attendance') && teacherSubjectIds.length > 0
+        ? fetchAllRows('attendance_records', 'id,subject_id,student_id,date,period,status,note', q => {
+            let query = q.in('subject_id', teacherSubjectIds);
+            if (period) query = query.eq('period', period);
+            return applySince(query);
+          })
+        : Promise.resolve([]);
+
+      [visibleScores, visibleAttendance] = await Promise.all([scorePromise, attendancePromise]);
+
+    } else if (isStudent) {
+      const studentUser = (await supabase.from('users').select('*').eq('id', req.user!.userId).maybeSingle()).data;
+      if (studentUser) {
+        visibleUsers = [studentUser];
+        const studentSectionIds = parseSectionIds(studentUser.section_id);
+
+        const sectionPromise = studentSectionIds.length > 0
+          ? fetchAllRows('sections', 'id,name,grade_level_or_year,academic_year,semester,room,description', q => applySince(q).in('id', studentSectionIds))
+          : Promise.resolve([]);
+
+        const subjectPromise = studentSectionIds.length > 0
+          ? fetchAllRows('subjects', '*', q => {
+              let query = q.in('section_id', studentSectionIds);
+              if (subjectId) query = query.eq('id', subjectId);
+              return applySince(query);
+            })
+          : Promise.resolve([]);
+
+        [visibleSections, visibleSubjects] = await Promise.all([sectionPromise, subjectPromise]);
+        const studSubjectIds = visibleSubjects.map(s => s.id);
+
+        const assessmentPromise = studSubjectIds.length > 0
+          ? fetchAllRows('assessments', 'id,subject_id,category_id,parent_category_id,period,title,max_score,date,due_date,description', q => {
+              let query = q.in('subject_id', studSubjectIds);
+              if (period) query = query.eq('period', period);
+              return applySince(query);
+            })
+          : Promise.resolve([]);
+
+        visibleAssessments = await assessmentPromise;
+        const assessmentIds = visibleAssessments.map(a => a.id);
+
+        const scorePromise = !excludeSet.has('scores') && assessmentIds.length > 0
+          ? fetchAllRows('score_records', 'id,assessment_id,student_id,score,remarks,submitted_at', q => applySince(q).eq('student_id', req.user!.userId).in('assessment_id', assessmentIds))
+          : Promise.resolve([]);
+
+        const attendancePromise = !excludeSet.has('attendance') && studSubjectIds.length > 0
+          ? fetchAllRows('attendance_records', 'id,subject_id,student_id,date,period,status,note', q => {
+              let query = q.eq('student_id', req.user!.userId).in('subject_id', studSubjectIds);
+              if (period) query = query.eq('period', period);
+              return applySince(query);
+            })
+          : Promise.resolve([]);
+
+        [visibleScores, visibleAttendance] = await Promise.all([scorePromise, attendancePromise]);
+      }
     }
 
     const mappedUsers = visibleUsers.map((u: any) => {
@@ -472,11 +588,12 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
         id: s.id, name: s.name, gradeLevelOrYear: s.grade_level_or_year,
         academicYear: s.academic_year, semester: s.semester,
         room: s.room || undefined, description, adviserId,
+        studentCount: mappedUsers.filter((u: any) => u.role === 'student' && (u.sectionId === s.id || u.sectionIds?.includes(s.id))).length,
       };
     });
 
     const matrixTemplates = rawTemplates
-      .filter((t: any) => t.id !== 'sys-auth-vault')
+      .filter((t: any) => t.id !== 'sys-auth-vault' && t.id !== 'sys-course-catalog')
       .map((t: any) => {
         let matrix = t.matrix || [];
         let useTransmutation = true;
@@ -487,13 +604,20 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
         return {
           id: t.id, name: t.name, description: t.description || undefined,
           isDefault: t.is_default ?? false, passingGrade: t.passing_grade ?? 75,
+          gradeDisplayMode: t.grade_display_mode || 'both',
           matrix,
           useTransmutation,
         };
       });
 
+    const templateMap = new Map((rawTemplates || []).map((t: any) => [t.id, t]));
     const mappedSubjects = visibleSubjects.map((sub: any) => {
-      let matrix = sub.matrix || [];
+      let matrix = sub.matrix;
+      if (!matrix || (Array.isArray(matrix) && matrix.length === 0)) {
+        const tmpl = sub.grading_matrix_template_id ? templateMap.get(sub.grading_matrix_template_id) : null;
+        if (tmpl?.matrix) matrix = tmpl.matrix;
+      }
+      if (!matrix) matrix = [];
       let useTransmutation = true;
       if (matrix && !Array.isArray(matrix) && typeof matrix === 'object') {
         useTransmutation = matrix.useTransmutation !== false;
@@ -501,7 +625,7 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       }
       return {
         id: sub.id, sectionId: sub.section_id, teacherId: sub.teacher_id,
-        name: sub.name, code: sub.code, schedule: sub.schedule,
+        name: sub.name, code: sub.code, schedule: parseSchedule(sub.schedule), gradingMatrixTemplateId: sub.grading_matrix_template_id || undefined, gradeDisplayMode: sub.grade_display_mode || 'both', customMatrix: sub.custom_matrix || undefined,
         units: sub.units, passingGrade: sub.passing_grade ?? 75,
         matrix,
         useTransmutation,
@@ -530,7 +654,7 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       description: h.description || undefined,
     }));
 
-    res.json({ users: mappedUsers, sections: mappedSections, subjects: mappedSubjects, assessments: mappedAssessments, scores: mappedScores, attendance: mappedAttendance, matrixTemplates, holidays: mappedHolidays });
+    res.json({ users: mappedUsers, sections: mappedSections, subjects: mappedSubjects, courses: catalogCourses, assessments: mappedAssessments, scores: mappedScores, attendance: mappedAttendance, matrixTemplates, holidays: mappedHolidays });
   } catch (err) {
     console.error('Failed to load all data:', err);
     res.status(500).json({ error: 'Failed to load data' });
@@ -538,6 +662,50 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
 });
 
 // POST /api/data/sync — process batch mutations
+
+// GET /api/data/courses — Fetch all courses in Dean's curriculum catalog
+router.get('/courses', async (_req: AuthRequest, res: Response) => {
+  try {
+    const catalog = await getCourseCatalog();
+    res.json(catalog);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to fetch course catalog' });
+  }
+});
+
+// POST /api/data/courses — Add a course to Dean's curriculum catalog
+router.post('/courses', requireDean, async (req: AuthRequest, res: Response) => {
+  try {
+    const { name, code, units, passingGrade, gradingMatrixTemplateId, matrix, department } = req.body;
+    if (!name || !code) {
+      res.status(400).json({ error: 'Course Title and Course Code are required.' });
+      return;
+    }
+    const created = await addCourseToCatalog({
+      name,
+      code,
+      units: Number(units) || 3,
+      passingGrade: Number(passingGrade) || 75,
+      gradingMatrixTemplateId,
+      matrix,
+      department,
+    });
+    res.status(201).json(created);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to create course in catalog' });
+  }
+});
+
+// DELETE /api/data/courses/:id — Delete a course from Dean's curriculum catalog
+router.delete('/courses/:id', requireDean, async (req: AuthRequest, res: Response) => {
+  try {
+    const success = await deleteCourseFromCatalog(req.params.id);
+    res.json({ success });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to delete course' });
+  }
+});
+
 router.post('/sync', async (req: AuthRequest, res: Response) => {
   if (!isSupabaseConfigured || !supabase) {
     res.status(503).json({ error: 'Database not configured' });
@@ -830,6 +998,13 @@ router.post('/sync', async (req: AuthRequest, res: Response) => {
         const ids = group.map(m => m.payload.id).filter(Boolean);
         if (ids.length > 0) {
           const { error } = await supabase!.from(table).delete().in('id', ids);
+          if (table === 'score_records') {
+            for (const m of group) {
+              if (m.payload.assessment_id && m.payload.student_id) {
+                await supabase!.from('score_records').delete().eq('assessment_id', m.payload.assessment_id).eq('student_id', m.payload.student_id);
+              }
+            }
+          }
           if (error) errors.push(`${table} DELETE: ${error.message}`);
           else {
             if (table === 'users') await pruneVaultToActiveUsers();
@@ -1033,6 +1208,72 @@ router.delete('/wipe', requireFaculty, async (req: AuthRequest, res: Response) =
     }
     await pruneVaultToActiveUsers();
     res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/data/clear-database — Clears all students, teachers, classes, subjects, assessments, retaining only Dean account
+router.post('/clear-database', requireFaculty, async (req: AuthRequest, res: Response) => {
+  if (!isSupabaseConfigured || !supabase) { res.status(503).json({ error: 'DB not configured' }); return; }
+  if (req.user?.role !== 'dean') {
+    res.status(403).json({ error: 'Dean access required to clear database' });
+    return;
+  }
+  try {
+    // 1. Wipe scores, attendance, assessments, subjects, sections, audit logs
+    await supabase.from('score_records').delete().not('id', 'is', null);
+    await supabase.from('attendance_records').delete().not('id', 'is', null);
+    await supabase.from('assessments').delete().not('id', 'is', null);
+    await supabase.from('subjects').delete().not('id', 'is', null);
+    await supabase.from('sections').delete().not('id', 'is', null);
+    await supabase.from('audit_logs').delete().not('id', 'is', null);
+
+    // 2. Delete all non-dean users
+    await supabase.from('users').delete().neq('role', 'dean');
+
+    // 3. Delete non-dean users from Supabase Auth
+    try {
+      const { data: authUsers } = await supabase.auth.admin.listUsers({ page: 1, perPage: 500 });
+      if (authUsers?.users) {
+        for (const u of authUsers.users) {
+          const email = u.email?.toLowerCase() || '';
+          const isDean = email === 'dean@gradely.edu' || email === 'rommel.constantino@gradely.edu' || u.user_metadata?.role === 'dean';
+          if (!isDean) {
+            await supabase.auth.admin.deleteUser(u.id);
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 4. Ensure dean-admin exists with password123
+    const bcrypt = await import('bcryptjs');
+    const passwordHash = await bcrypt.default.hash('password123', 10);
+    await supabase.from('users').upsert({
+      id: 'dean-admin',
+      name: 'College Dean',
+      email: 'dean@gradely.edu',
+      role: 'dean',
+      title: 'College Dean & Administrator',
+      department: 'College of Computing Studies',
+      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=DeanAdmin',
+      student_number: null,
+      section_id: null,
+      must_change_password: false,
+    }, { onConflict: 'id' });
+
+    // 5. Rebuild vault for deans only
+    const { saveVault } = await import('../lib/authVault');
+    await saveVault([
+      { userId: 'dean-admin', email: 'dean@gradely.edu', passwordHash, mustChange: false },
+      { userId: 'e061f5c1-a24b-40a4-8725-72786b97ae2f', email: 'rommel.constantino@gradely.edu', passwordHash, mustChange: false },
+    ]);
+
+    res.json({
+      success: true,
+      message: 'Database cleared successfully. All students, courses, and data removed. Dean account retained.',
+      deanAccount: 'dean@gradely.edu',
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

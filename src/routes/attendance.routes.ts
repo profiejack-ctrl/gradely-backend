@@ -1,10 +1,10 @@
 import { Router, Response } from 'express';
-import { requireFaculty, AuthRequest } from '../middleware/auth';
+import { requireAuth, requireFaculty, AuthRequest } from '../middleware/auth';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { parseSectionIds } from '../lib/helpers';
 
 const router = Router();
-router.use(requireFaculty);
+router.use(requireAuth, requireFaculty);
 
 const ATTENDANCE_STATUSES = new Set(['present', 'late', 'absent', 'excused']);
 const PERIODS = new Set(['prelim', 'midterm', 'finals']);

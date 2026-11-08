@@ -38,7 +38,7 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
 
     if (error) {
       console.error(`[auth] Supabase database error looking up user ${decoded.userId}:`, error.message);
-      res.status(500).json({ error: 'Database error validating session' });
+      res.status(500).json({ error: 'Database error validating session', details: error.message });
       return;
     }
 

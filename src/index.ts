@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import compression from 'compression';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import authRoutes from './routes/auth.routes';
@@ -69,9 +70,10 @@ app.options('*', cors(corsOptions));
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
+app.use(compression());
 app.use(morgan('dev'));
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // API documentation
 app.get('/docs/openapi.json', (_req, res) => {

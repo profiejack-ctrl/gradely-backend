@@ -5,7 +5,7 @@ const auth_1 = require("../middleware/auth");
 const supabase_1 = require("../lib/supabase");
 const helpers_1 = require("../lib/helpers");
 const router = (0, express_1.Router)();
-router.use(auth_1.requireFaculty);
+router.use(auth_1.requireAuth, auth_1.requireFaculty);
 const ATTENDANCE_STATUSES = new Set(['present', 'late', 'absent', 'excused']);
 const PERIODS = new Set(['prelim', 'midterm', 'finals']);
 function isDate(value) {
