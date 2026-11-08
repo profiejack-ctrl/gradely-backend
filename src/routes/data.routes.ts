@@ -286,13 +286,13 @@ function normalizePayload(table: string, payload: any, reqUser?: AuthPayload): a
     }
   }
   const fieldsByTable: Record<string, string[]> = {
-    users: ['id', 'name', 'first_name', 'last_name', 'email', 'role', 'student_number', 'section_id', 'avatar', 'department', 'title', 'address', 'contact_number'],
+    users: ['id', 'name', 'email', 'role', 'student_number', 'section_id', 'avatar', 'department', 'title'],
     sections: ['id', 'name', 'grade_level_or_year', 'academic_year', 'semester', 'room', 'description'],
-    subjects: ['id', 'section_id', 'teacher_id', 'name', 'code', 'schedule', 'units', 'passing_grade', 'matrix', 'grading_matrix_template_id', 'grade_display_mode', 'custom_matrix'],
+    subjects: ['id', 'section_id', 'teacher_id', 'name', 'code', 'schedule', 'units', 'passing_grade', 'matrix'],
     assessments: ['id', 'subject_id', 'category_id', 'parent_category_id', 'period', 'title', 'max_score', 'date', 'due_date', 'description'],
     score_records: ['id', 'assessment_id', 'student_id', 'score', 'remarks', 'submitted_at'],
     attendance_records: ['id', 'subject_id', 'student_id', 'date', 'period', 'status', 'note'],
-    grading_matrix_templates: ['id', 'name', 'description', 'is_default', 'passing_grade', 'matrix', 'grade_display_mode'],
+    grading_matrix_templates: ['id', 'name', 'description', 'is_default', 'passing_grade', 'matrix'],
     holidays: ['id', 'date', 'title', 'type', 'description'],
   };
   const allowed = new Set(fieldsByTable[table] || []);
