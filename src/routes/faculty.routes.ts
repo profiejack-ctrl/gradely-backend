@@ -784,14 +784,35 @@ router.get('/subjects/:subjectId/attendance', async (req: AuthRequest, res: Resp
 router.get('/matrix-templates', async (_req: AuthRequest, res: Response): Promise<void> => {
   if (!ensureConfigured(res)) return;
   try {
-    const { data: templates = [], error } = await supabase!
+    const { data: rawTemplates = [], error } = await supabase!
       .from('grading_matrix_templates')
       .select('id,name,description,is_default,passing_grade,matrix')
       .neq('id', 'sys-auth-vault')
+      .neq('id', 'sys-course-catalog')
       .order('name', { ascending: true });
 
     if (error) throw error;
-    res.json(templates || []);
+    const normalized = (rawTemplates || []).map((t: any) => {
+      let matrix = t.matrix || [];
+      let useTransmutation = true;
+      if (matrix && !Array.isArray(matrix) && typeof matrix === 'object') {
+        useTransmutation = matrix.useTransmutation !== false;
+        matrix = matrix.categories || [];
+      }
+      return {
+        id: t.id,
+        name: t.name,
+        description: t.description || undefined,
+        isDefault: Boolean(t.is_default),
+        is_default: Boolean(t.is_default),
+        passingGrade: Number(t.passing_grade) || 75,
+        passing_grade: Number(t.passing_grade) || 75,
+        matrix,
+        useTransmutation,
+      };
+    });
+
+    res.json(normalized);
   } catch (err: any) {
     console.error('Matrix templates error:', err);
     res.status(500).json({ error: 'Failed to load matrix templates' });
