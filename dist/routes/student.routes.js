@@ -115,6 +115,7 @@ function mapSubject(subject, teacher, template) {
  * weighted category grades including raw and transmuted values.
  */
 function calculateSubjectPeriodProgress(subject, period, periodAssessments, periodAttendance, scoreByAssessment, matrix, gradeDisplayMode) {
+    const hasAttendanceRecords = periodAttendance.length > 0;
     const attendanceMetrics = (0, helpers_1.calculateAttendanceMetrics)(periodAttendance);
     const attCategory = matrix.find(c => c.isAttendance || c.id === 'attendance' || /attendance/i.test(c.name)) || {
         id: 'attendance',
@@ -122,30 +123,32 @@ function calculateSubjectPeriodProgress(subject, period, periodAssessments, peri
         weight: 10,
         isAttendance: true,
     };
-    // 1. Synthesize live Attendance Assessment into the period's assessments
-    const syntheticAttendanceAssessment = {
-        id: `att-${subject.id}-${period}`,
-        subjectId: subject.id,
-        categoryId: attCategory.id,
-        categoryName: attCategory.name,
-        period,
-        title: `${period.toUpperCase()} Attendance Record`,
-        maxScore: 100,
-        date: new Date().toISOString().slice(0, 10),
-        isAttendance: true,
-        description: `Auto-computed from ${attendanceMetrics.total} attendance session(s)`,
-        score: {
-            id: `att-score-${subject.id}-${period}`,
-            rawScore: attendanceMetrics.attendancePercent,
+    // 1. Synthesize live Attendance Assessment into the period's assessments if attendance was conducted
+    const allAssessments = [...periodAssessments];
+    if (hasAttendanceRecords) {
+        allAssessments.push({
+            id: `att-${subject.id}-${period}`,
+            subjectId: subject.id,
+            categoryId: attCategory.id,
+            categoryName: attCategory.name,
+            period,
+            title: `${period.toUpperCase()} Attendance Record`,
             maxScore: 100,
-            rawPercent: attendanceMetrics.attendancePercent,
-            transmutedGrade: attendanceMetrics.attendancePercent, // Attendance is Fixed
-            submittedAt: new Date().toISOString(),
-            remarks: `${attendanceMetrics.present} present, ${attendanceMetrics.late} late, ${attendanceMetrics.absent} absent`,
-        },
-    };
-    const allAssessments = [...periodAssessments, syntheticAttendanceAssessment];
-    // 2. Calculate category-level weighted averages
+            date: new Date().toISOString().slice(0, 10),
+            isAttendance: true,
+            description: `Auto-computed from ${attendanceMetrics.total} attendance session(s)`,
+            score: {
+                id: `att-score-${subject.id}-${period}`,
+                rawScore: attendanceMetrics.attendancePercent,
+                maxScore: 100,
+                rawPercent: attendanceMetrics.attendancePercent,
+                transmutedGrade: attendanceMetrics.attendancePercent, // Attendance is Fixed
+                submittedAt: new Date().toISOString(),
+                remarks: `${attendanceMetrics.present} present, ${attendanceMetrics.late} late, ${attendanceMetrics.absent} absent`,
+            },
+        });
+    }
+    // 2. Calculate category-level weighted averages (matching Philippine BCP standard)
     let totalWeight = 0;
     let totalWeightedScore = 0;
     let totalTransmutedWeightedScore = 0;
@@ -156,40 +159,111 @@ function calculateSubjectPeriodProgress(subject, period, periodAssessments, peri
         let earned = 0;
         let possible = 0;
         if (isAtt) {
-            earned = attendanceMetrics.attendancePercent;
-            possible = 100;
-        }
-        else {
-            const catAssessments = periodAssessments.filter(a => a.category_id === category.id);
-            for (const a of catAssessments) {
-                const sc = scoreByAssessment.get(a.id);
-                if (sc && Number.isFinite(Number(sc.score))) {
-                    earned += Math.max(0, Number(sc.score));
-                    possible += Math.max(0, Number(a.max_score) || 0);
-                }
+            if (hasAttendanceRecords) {
+                earned = attendanceMetrics.attendancePercent;
+                possible = 100;
+                const categoryPercent = attendanceMetrics.attendancePercent;
+                const categoryTransmuted = categoryPercent;
+                totalWeight += category.weight;
+                totalWeightedScore += (categoryPercent * category.weight) / 100;
+                totalTransmutedWeightedScore += (categoryTransmuted * category.weight) / 100;
+                return {
+                    categoryId: category.id,
+                    name: category.name,
+                    weight: category.weight,
+                    isAttendance: true,
+                    earned,
+                    possible,
+                    rawPercent: categoryPercent,
+                    transmutedGrade: categoryTransmuted,
+                };
+            }
+            else {
+                // No attendance records yet for this period
+                return {
+                    categoryId: category.id,
+                    name: category.name,
+                    weight: category.weight,
+                    isAttendance: true,
+                    earned: 0,
+                    possible: 0,
+                    rawPercent: null,
+                    transmutedGrade: null,
+                };
             }
         }
-        const categoryPercent = possible > 0 ? Math.round((earned / possible) * 1000) / 10 : null;
-        const categoryTransmuted = categoryPercent !== null
-            ? (isFixed
-                ? categoryPercent
-                : (0, helpers_1.transmuteScore)(categoryPercent, 100, subject.passingGrade || 75).transmutedGrade)
-            : null;
-        if (categoryPercent !== null) {
-            totalWeight += category.weight;
-            totalWeightedScore += (categoryPercent * category.weight) / 100;
-            totalTransmutedWeightedScore += ((categoryTransmuted ?? categoryPercent) * category.weight) / 100;
+        else {
+            const catAssessments = periodAssessments.filter(a => a.category_id === category.id || a.categoryId === category.id);
+            if (catAssessments.length === 0) {
+                return {
+                    categoryId: category.id,
+                    name: category.name,
+                    weight: category.weight,
+                    isAttendance: false,
+                    earned: 0,
+                    possible: 0,
+                    rawPercent: null,
+                    transmutedGrade: null,
+                };
+            }
+            if (isFixed) {
+                // Fixed categories (Project/CBO): not transmuted, no attempt = 0%
+                for (const a of catAssessments) {
+                    const sc = scoreByAssessment.get(a.id);
+                    const max = Number(a.max_score) || 100;
+                    if (sc && Number.isFinite(Number(sc.score))) {
+                        earned += Math.max(0, Number(sc.score));
+                    }
+                    possible += max;
+                }
+                const categoryPercent = possible > 0 ? Math.round((earned / possible) * 1000) / 10 : 0;
+                const categoryTransmuted = categoryPercent;
+                totalWeight += category.weight;
+                totalWeightedScore += (categoryPercent * category.weight) / 100;
+                totalTransmutedWeightedScore += (categoryTransmuted * category.weight) / 100;
+                return {
+                    categoryId: category.id,
+                    name: category.name,
+                    weight: category.weight,
+                    isAttendance: false,
+                    earned,
+                    possible,
+                    rawPercent: categoryPercent,
+                    transmutedGrade: categoryTransmuted,
+                };
+            }
+            else {
+                // Transmutable categories (Quizzes, Written Works, Performance Tasks, Exam)
+                // BCP standard: Attempt with 0 -> 65; Attempt with score -> transmuted; No attempt floor -> 50.0
+                let sumTransmuted = 0;
+                for (const a of catAssessments) {
+                    const sc = scoreByAssessment.get(a.id);
+                    const max = Number(a.max_score) || 100;
+                    const scoreVal = sc && Number.isFinite(Number(sc.score)) ? Number(sc.score) : null;
+                    const transmutedRes = (0, helpers_1.transmuteScore)(scoreVal, max, subject.passingGrade || 75);
+                    sumTransmuted += transmutedRes.transmutedGrade;
+                    if (transmutedRes.hasAttempt) {
+                        earned += Math.max(0, scoreVal);
+                    }
+                    possible += max;
+                }
+                const categoryPercent = possible > 0 ? Math.round((earned / possible) * 1000) / 10 : 0;
+                const categoryTransmuted = Math.round((sumTransmuted / catAssessments.length) * 10) / 10;
+                totalWeight += category.weight;
+                totalWeightedScore += (categoryPercent * category.weight) / 100;
+                totalTransmutedWeightedScore += (categoryTransmuted * category.weight) / 100;
+                return {
+                    categoryId: category.id,
+                    name: category.name,
+                    weight: category.weight,
+                    isAttendance: false,
+                    earned,
+                    possible,
+                    rawPercent: categoryPercent,
+                    transmutedGrade: categoryTransmuted,
+                };
+            }
         }
-        return {
-            categoryId: category.id,
-            name: category.name,
-            weight: category.weight,
-            isAttendance: Boolean(isAtt),
-            earned,
-            possible,
-            rawPercent: categoryPercent,
-            transmutedGrade: categoryTransmuted,
-        };
     });
     const periodRawPercent = totalWeight > 0 ? Math.round((totalWeightedScore / (totalWeight / 100)) * 10) / 10 : null;
     // Only transmute once: already transmuted at component level
@@ -562,13 +636,63 @@ router.get('/subjects', async (req, res) => {
         }
         const subjects = Array.from(uniqueSubjectsMap.values());
         const teacherIds = [...new Set(subjects.map(s => s.teacher_id).filter(Boolean))];
-        const [teachersRes] = await Promise.all([
+        const subjectIds = subjects.map(s => s.id);
+        const [teachersRes, attendanceRes, assessmentsRes] = await Promise.all([
             teacherIds.length ? supabase_1.supabase.from('users').select('id,name').in('id', teacherIds) : { data: [] },
+            subjectIds.length ? supabase_1.supabase.from('attendance_records').select('*').eq('student_id', req.user.userId).in('subject_id', subjectIds) : { data: [] },
+            subjectIds.length ? supabase_1.supabase.from('assessments').select('*').in('subject_id', subjectIds) : { data: [] },
         ]);
+        const assessments = assessmentsRes.data || [];
+        const attendance = attendanceRes.data || [];
+        const assessmentIds = assessments.map(a => a.id);
+        const { data: scoresData } = assessmentIds.length
+            ? await supabase_1.supabase.from('score_records').select('*').eq('student_id', req.user.userId).in('assessment_id', assessmentIds)
+            : { data: [] };
+        const scoreMap = new Map((scoresData || []).map(sc => [sc.assessment_id, sc]));
         const teachersById = new Map((teachersRes.data || []).map(t => [t.id, t]));
+        const mappedSubjects = subjects.map(s => {
+            const teacher = teachersById.get(s.teacher_id);
+            const mapped = mapSubject(s, teacher);
+            const subAssessments = assessments.filter(a => a.subject_id === s.id);
+            const subAttendance = attendance.filter(a => a.subject_id === s.id);
+            let currentGrade = null;
+            let activePeriodName = 'prelim';
+            for (const p of PERIODS) {
+                const pAss = subAssessments.filter(a => (a.period || 'prelim') === p);
+                const pAtt = subAttendance.filter(a => (a.period || 'prelim') === p);
+                if (pAss.length > 0 || pAtt.length > 0) {
+                    const prog = calculateSubjectPeriodProgress(s, p, pAss, pAtt, scoreMap, mapped.matrix, mapped.gradeDisplayMode);
+                    if (prog.transmutedGrade !== null) {
+                        currentGrade = prog.transmutedGrade;
+                        activePeriodName = p;
+                    }
+                    else if (prog.rawGrade !== null) {
+                        currentGrade = prog.rawGrade;
+                        activePeriodName = p;
+                    }
+                }
+            }
+            let scoredCount = 0;
+            for (const a of subAssessments) {
+                if (scoreMap.has(a.id))
+                    scoredCount++;
+            }
+            const totalCount = subAssessments.length;
+            const completion = totalCount > 0 ? (scoredCount / totalCount) * 100 : 0;
+            return {
+                ...mapped,
+                rawScorePercent: currentGrade,
+                grade: currentGrade,
+                transmutedGrade: currentGrade,
+                period: activePeriodName,
+                assessmentCount: totalCount,
+                scoredAssessmentCount: scoredCount,
+                scoreCompletionPercent: Math.round(completion * 10) / 10,
+            };
+        });
         res.json({
             sections: profile.sections,
-            subjects: subjects.map(s => mapSubject(s, teachersById.get(s.teacher_id))),
+            subjects: mappedSubjects,
         });
     }
     catch (error) {
@@ -626,9 +750,39 @@ router.get('/subjects/:subjectId', async (req, res) => {
                 calculateSubjectPeriodProgress(subject, period, periodAssessments, periodAttendance, scoreByAssessment, mappedSubject.matrix, mappedSubject.gradeDisplayMode),
             ];
         }));
+        // Find the latest active period with recorded grades
+        const activePeriodProgress = (periodsProgress['finals']?.transmutedGrade !== null || periodsProgress['finals']?.rawGrade !== null)
+            ? periodsProgress['finals']
+            : (periodsProgress['midterm']?.transmutedGrade !== null || periodsProgress['midterm']?.rawGrade !== null)
+                ? periodsProgress['midterm']
+                : periodsProgress['prelim'];
+        const resolvedGrade = activePeriodProgress?.transmutedGrade ?? activePeriodProgress?.rawGrade ?? null;
+        const scoredCount = scoresData?.length || 0;
+        const totalCount = assessments.length;
+        const completion = totalCount > 0 ? (scoredCount / totalCount) * 100 : 0;
+        const progressSummary = {
+            rawScorePercent: resolvedGrade,
+            grade: resolvedGrade,
+            transmutedGrade: resolvedGrade,
+            period: activePeriodProgress?.period || 'prelim',
+            assessmentCount: totalCount,
+            scoredAssessmentCount: scoredCount,
+            scoreCompletionPercent: Math.round(completion * 10) / 10,
+            periods: periodsProgress,
+        };
         res.json({
             student: profile.student,
-            subject: mappedSubject,
+            subject: {
+                ...mappedSubject,
+                rawScorePercent: resolvedGrade,
+                grade: resolvedGrade,
+                transmutedGrade: resolvedGrade,
+                period: activePeriodProgress?.period || 'prelim',
+                assessmentCount: totalCount,
+                scoredAssessmentCount: scoredCount,
+                scoreCompletionPercent: Math.round(completion * 10) / 10,
+            },
+            progress: progressSummary,
             periods: periodsProgress,
             rawAttendanceRecords: attendance.map(a => ({
                 id: a.id,
