@@ -190,14 +190,22 @@ router.get('/subjects', async (req: AuthRequest, res: Response): Promise<void> =
     const isDean = req.user?.role === 'dean';
     const query = supabase!
       .from('subjects')
-      .select('id,section_id,teacher_id,name,code,units,passing_grade,matrix,schedule,grading_matrix_template_id,grade_display_mode');
+      .select('id,section_id,teacher_id,name,code,units,passing_grade,matrix,schedule');
     if (!isDean) query.eq('teacher_id', req.user!.userId);
 
     const { data: rawSubjects = [], error: subErr } = await query.order('code', { ascending: true });
+    // Deduplicate subjects by ID
+    const uniqueMap = new Map<string, any>();
+    for (const s of ((rawSubjects as any[]) || [])) {
+      if (!uniqueMap.has(s.id)) {
+        uniqueMap.set(s.id, s);
+      }
+    }
+    const deduplicatedSubjects = Array.from(uniqueMap.values());
     if (subErr) throw subErr;
 
-    const sectionIds = [...new Set((rawSubjects || []).map(s => s.section_id).filter(Boolean))];
-    const templateIds = [...new Set((rawSubjects || []).map(s => s.grading_matrix_template_id).filter(Boolean))];
+    const sectionIds = [...new Set((deduplicatedSubjects || []).map(s => s.section_id).filter(Boolean))];
+    const templateIds: string[] = [];
 
     const [sectionsRes, templatesRes] = await Promise.all([
       sectionIds.length ? supabase!.from('sections').select('id,name,grade_level_or_year,semester').in('id', sectionIds) : { data: [] },
@@ -207,7 +215,7 @@ router.get('/subjects', async (req: AuthRequest, res: Response): Promise<void> =
     const sectionMap = new Map((sectionsRes.data || []).map(s => [s.id, s]));
     const templateMap = new Map((templatesRes.data || []).map(t => [t.id, t.name]));
 
-    const subjects = (rawSubjects || []).map(s => {
+    const subjects = (deduplicatedSubjects || []).map(s => {
       const section = sectionMap.get(s.section_id);
       return {
         id: s.id,
@@ -219,7 +227,7 @@ router.get('/subjects', async (req: AuthRequest, res: Response): Promise<void> =
         units: s.units ?? 3,
         passingGrade: s.passing_grade ?? 75,
         gradeDisplayMode: s.grade_display_mode || 'both',
-        templateName: templateMap.get(s.grading_matrix_template_id) || 'Standard Matrix',
+        templateName: 'Standard Matrix',
         schedule: parseSchedule(s.schedule),
       };
     });
@@ -778,7 +786,7 @@ router.get('/matrix-templates', async (_req: AuthRequest, res: Response): Promis
   try {
     const { data: templates = [], error } = await supabase!
       .from('grading_matrix_templates')
-      .select('id,name,description,is_default,passing_grade,grade_display_mode,matrix')
+      .select('id,name,description,is_default,passing_grade,matrix')
       .neq('id', 'sys-auth-vault')
       .order('name', { ascending: true });
 

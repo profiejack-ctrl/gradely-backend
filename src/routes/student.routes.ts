@@ -283,7 +283,8 @@ async function loadStudentProfile(studentId: string) {
     .single();
   if (studentError) throw studentError;
 
-  const sectionIds = parseSectionIds(student.section_id);
+  const rawSectionIds = parseSectionIds(student.section_id);
+  const sectionIds = [...new Set(rawSectionIds)].filter(Boolean);
   const sectionsResult = sectionIds.length
     ? await supabase.from('sections').select('id,name,grade_level_or_year,academic_year,semester,room').in('id', sectionIds)
     : { data: [], error: null };
@@ -360,29 +361,16 @@ router.put('/profile', async (req: AuthRequest, res: Response): Promise<void> =>
 
     const updates: any = {};
 
-    if (cleanFirstName !== undefined) updates.first_name = cleanFirstName;
-    if (cleanLastName !== undefined) updates.last_name = cleanLastName;
-
-    // Build unified name if firstName or lastName is updated
+    // Build unified name if firstName or lastName or name is provided
     if (cleanFirstName !== undefined || cleanLastName !== undefined) {
-      const { data: existingUser } = await supabase!
-        .from('users')
-        .select('first_name, last_name, name')
-        .eq('id', req.user.userId)
-        .single();
-      const fn = cleanFirstName !== undefined ? cleanFirstName : (existingUser?.first_name || '');
-      const ln = cleanLastName !== undefined ? cleanLastName : (existingUser?.last_name || '');
+      const fn = cleanFirstName !== undefined ? cleanFirstName : '';
+      const ln = cleanLastName !== undefined ? cleanLastName : '';
       const combined = `${fn} ${ln}`.trim();
       if (combined) updates.name = combined;
     } else if (name && typeof name === 'string' && name.trim().length >= 2) {
       updates.name = name.trim();
-      const parts = updates.name.split(/\s+/);
-      updates.first_name = parts[0] || '';
-      updates.last_name = parts.slice(1).join(' ') || '';
     }
 
-    if (cleanAddress !== undefined) updates.address = cleanAddress;
-    if (cleanContactNumber !== undefined) updates.contact_number = cleanContactNumber;
     if (cleanAvatar !== undefined) updates.avatar = cleanAvatar;
 
     if (Object.keys(updates).length > 0) {
@@ -452,25 +440,29 @@ router.get('/dashboard', async (req: AuthRequest, res: Response): Promise<void> 
     // 1. Fetch subjects, templates, and teachers
     const { data: subjectsData, error: subErr } = await supabase!
       .from('subjects')
-      .select('id,section_id,teacher_id,name,code,schedule,units,passing_grade,grade_display_mode,grading_matrix_template_id,custom_matrix,matrix')
+      .select('id,section_id,teacher_id,name,code,schedule,units,passing_grade,matrix')
       .in('section_id', profile.sectionIds);
     if (subErr) throw subErr;
 
-    const subjects = subjectsData || [];
+    // Deduplicate subjects by ID so students never receive duplicate offerings
+    const uniqueSubjectsMap = new Map<string, any>();
+    for (const s of (subjectsData || [])) {
+      if (!uniqueSubjectsMap.has(s.id)) {
+        uniqueSubjectsMap.set(s.id, s);
+      }
+    }
+    const subjects = Array.from(uniqueSubjectsMap.values());
     const subjectIds = subjects.map(s => s.id);
     const teacherIds = [...new Set(subjects.map(s => s.teacher_id).filter(Boolean))];
-    const templateIds = [...new Set(subjects.map(s => s.grading_matrix_template_id).filter(Boolean))];
 
     // 2. Fetch parallel auxiliary data
-    const [teachersRes, templatesRes, attendanceRes, assessmentsRes] = await Promise.all([
+    const [teachersRes, attendanceRes, assessmentsRes] = await Promise.all([
       teacherIds.length ? supabase!.from('users').select('id,name').in('id', teacherIds) : { data: [] },
-      templateIds.length ? supabase!.from('grading_matrix_templates').select('id,name,matrix,grade_display_mode').in('id', templateIds) : { data: [] },
       subjectIds.length ? supabase!.from('attendance_records').select('id,subject_id,date,status,period').eq('student_id', studentId).in('subject_id', subjectIds) : { data: [] },
       subjectIds.length ? supabase!.from('assessments').select('id,subject_id,title,max_score,date,due_date,period').in('subject_id', subjectIds).order('date', { ascending: false }).limit(6) : { data: [] },
     ]);
 
     const teachersById = new Map((teachersRes.data || []).map(t => [t.id, t]));
-    const templatesById = new Map((templatesRes.data || []).map(t => [t.id, t]));
     const allAttendance = attendanceRes.data || [];
     const recentAssessmentsRaw = assessmentsRes.data || [];
 
@@ -500,8 +492,7 @@ router.get('/dashboard', async (req: AuthRequest, res: Response): Promise<void> 
 
     const subjectsSummary = subjects.map(s => {
       const teacher = teachersById.get(s.teacher_id);
-      const template = templatesById.get(s.grading_matrix_template_id);
-      const mapped = mapSubject(s, teacher, template);
+      const mapped = mapSubject(s, teacher);
       const subjectAttendance = allAttendance.filter(a => a.subject_id === s.id);
       const subAttMetrics = calculateAttendanceMetrics(subjectAttendance);
 
@@ -586,26 +577,30 @@ router.get('/subjects', async (req: AuthRequest, res: Response): Promise<void> =
 
     const { data: subjectsData, error: subErr } = await supabase!
       .from('subjects')
-      .select('id,section_id,teacher_id,name,code,schedule,units,passing_grade,grade_display_mode,grading_matrix_template_id,custom_matrix,matrix')
+      .select('id,section_id,teacher_id,name,code,schedule,units,passing_grade,matrix')
       .in('section_id', profile.sectionIds)
       .order('code', { ascending: true });
     if (subErr) throw subErr;
 
-    const subjects = subjectsData || [];
+    // Deduplicate subjects by ID so students never receive duplicate offerings
+    const uniqueSubjectsMap = new Map<string, any>();
+    for (const s of (subjectsData || [])) {
+      if (!uniqueSubjectsMap.has(s.id)) {
+        uniqueSubjectsMap.set(s.id, s);
+      }
+    }
+    const subjects = Array.from(uniqueSubjectsMap.values());
     const teacherIds = [...new Set(subjects.map(s => s.teacher_id).filter(Boolean))];
-    const templateIds = [...new Set(subjects.map(s => s.grading_matrix_template_id).filter(Boolean))];
 
-    const [teachersRes, templatesRes] = await Promise.all([
+    const [teachersRes] = await Promise.all([
       teacherIds.length ? supabase!.from('users').select('id,name').in('id', teacherIds) : { data: [] },
-      templateIds.length ? supabase!.from('grading_matrix_templates').select('id,name,matrix,grade_display_mode').in('id', templateIds) : { data: [] },
     ]);
 
     const teachersById = new Map((teachersRes.data || []).map(t => [t.id, t]));
-    const templatesById = new Map((templatesRes.data || []).map(t => [t.id, t]));
 
     res.json({
       sections: profile.sections,
-      subjects: subjects.map(s => mapSubject(s, teachersById.get(s.teacher_id), templatesById.get(s.grading_matrix_template_id))),
+      subjects: subjects.map(s => mapSubject(s, teachersById.get(s.teacher_id))),
     });
   } catch (error: any) {
     console.error('Student subjects error:', error);
@@ -630,7 +625,7 @@ router.get('/subjects/:subjectId', async (req: AuthRequest, res: Response): Prom
 
     const { data: subject, error: subErr } = await supabase!
       .from('subjects')
-      .select('id,section_id,teacher_id,name,code,schedule,units,passing_grade,grade_display_mode,grading_matrix_template_id,custom_matrix,matrix')
+      .select('id,section_id,teacher_id,name,code,schedule,units,passing_grade,matrix')
       .eq('id', req.params.subjectId)
       .in('section_id', profile.sectionIds)
       .maybeSingle();
@@ -640,12 +635,9 @@ router.get('/subjects/:subjectId', async (req: AuthRequest, res: Response): Prom
       return;
     }
 
-    // Parallel fetch: teacher, template, assessments, scores, and attendance
-    const [teacherRes, templateRes, assessmentsRes, attendanceRes] = await Promise.all([
+    // Parallel fetch: teacher, assessments, scores, and attendance
+    const [teacherRes, assessmentsRes, attendanceRes] = await Promise.all([
       subject.teacher_id ? supabase!.from('users').select('id,name').eq('id', subject.teacher_id).maybeSingle() : { data: null },
-      subject.grading_matrix_template_id
-        ? supabase!.from('grading_matrix_templates').select('id,name,matrix,grade_display_mode').eq('id', subject.grading_matrix_template_id).maybeSingle()
-        : { data: null },
       supabase!.from('assessments').select('*').eq('subject_id', subject.id).order('date', { ascending: true }),
       supabase!.from('attendance_records').select('*').eq('student_id', studentId).eq('subject_id', subject.id).order('date', { ascending: false }),
     ]);
@@ -659,7 +651,7 @@ router.get('/subjects/:subjectId', async (req: AuthRequest, res: Response): Prom
       : { data: [] };
 
     const scoreByAssessment = new Map((scoresData || []).map(sc => [sc.assessment_id, sc]));
-    const mappedSubject = mapSubject(subject, teacherRes.data, templateRes.data);
+    const mappedSubject = mapSubject(subject, teacherRes.data);
 
     // Compute progress and period breakdowns with integrated attendance
     const periodsProgress = Object.fromEntries(

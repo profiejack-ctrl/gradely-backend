@@ -21,7 +21,7 @@ async function getCourseCatalog() {
     // 2. Also incorporate distinct courses from existing subjects
     const { data: subjects } = await supabase_1.supabase
         .from('subjects')
-        .select('name,code,units,passing_grade,grading_matrix_template_id,matrix')
+        .select('name,code,units,passing_grade,matrix')
         .order('created_at', { ascending: true });
     if (subjects && subjects.length > 0) {
         subjects.forEach((sub) => {
@@ -36,7 +36,7 @@ async function getCourseCatalog() {
                     code: codeUpper,
                     units: Number(sub.units) || 3,
                     passingGrade: Number(sub.passing_grade) || 75,
-                    gradingMatrixTemplateId: sub.grading_matrix_template_id || undefined,
+                    gradingMatrixTemplateId: undefined,
                     matrix: sub.matrix || undefined,
                     department: 'College of Computing Studies',
                     createdAt: new Date().toISOString(),

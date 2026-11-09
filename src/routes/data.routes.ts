@@ -611,7 +611,13 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       });
 
     const templateMap = new Map((rawTemplates || []).map((t: any) => [t.id, t]));
-    const mappedSubjects = visibleSubjects.map((sub: any) => {
+    const uniqueSubjectMap = new Map<string, any>();
+    for (const s of visibleSubjects) {
+      if (s?.id && !uniqueSubjectMap.has(s.id)) {
+        uniqueSubjectMap.set(s.id, s);
+      }
+    }
+    const mappedSubjects = Array.from(uniqueSubjectMap.values()).map((sub: any) => {
       let matrix = sub.matrix;
       if (!matrix || (Array.isArray(matrix) && matrix.length === 0)) {
         const tmpl = sub.grading_matrix_template_id ? templateMap.get(sub.grading_matrix_template_id) : null;
