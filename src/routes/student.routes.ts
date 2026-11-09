@@ -327,6 +327,7 @@ router.get('/profile', async (req: AuthRequest, res: Response): Promise<void> =>
  * - lastName / last_name
  * - address
  * - contactNumber / contact_number / phone
+ * - email
  * - avatar / profilePicture
  * - newPassword (optional, minimum 8 characters)
  */
@@ -338,6 +339,7 @@ router.put('/profile', async (req: AuthRequest, res: Response): Promise<void> =>
     lastName,
     last_name,
     name,
+    email,
     address,
     contactNumber,
     contact_number,
@@ -358,6 +360,7 @@ router.put('/profile', async (req: AuthRequest, res: Response): Promise<void> =>
     const cleanAvatar = (avatar ?? profilePicture ?? profile_picture) !== undefined
       ? String(avatar ?? profilePicture ?? profile_picture).trim()
       : undefined;
+    const rawEmail = email !== undefined ? String(email).trim().toLowerCase() : undefined;
 
     const updates: any = {};
 
@@ -371,7 +374,75 @@ router.put('/profile', async (req: AuthRequest, res: Response): Promise<void> =>
       updates.name = name.trim();
     }
 
-    if (cleanAvatar !== undefined) updates.avatar = cleanAvatar;
+    if (cleanAvatar !== undefined && cleanAvatar.length > 0) {
+      updates.avatar = cleanAvatar;
+    }
+
+    if (cleanAddress !== undefined) {
+      updates.address = cleanAddress;
+    }
+
+    if (cleanContactNumber !== undefined) {
+      updates.contact_number = cleanContactNumber;
+    }
+
+    // Email update and validation
+    if (rawEmail !== undefined && rawEmail.length > 0) {
+      if (!rawEmail.includes('@') || !rawEmail.includes('.')) {
+        res.status(400).json({ error: 'Please enter a valid email address' });
+        return;
+      }
+      // Check for collision with another account
+      const { data: existingUser } = await supabase!
+        .from('users')
+        .select('id')
+        .ilike('email', rawEmail)
+        .neq('id', req.user.userId)
+        .maybeSingle();
+
+      if (existingUser) {
+        res.status(400).json({ error: 'This email address is already in use by another account' });
+        return;
+      }
+      updates.email = rawEmail;
+    }
+
+    if (newPassword) {
+      if (typeof newPassword !== 'string' || newPassword.length < 8) {
+        res.status(400).json({ error: 'Password must be at least 8 characters' });
+        return;
+      }
+      const vault = await getVault();
+      const hash = await bcrypt.hash(newPassword, 10);
+      const idx = vault.findIndex(v => v.userId === req.user!.userId);
+      const vaultEmail = updates.email || req.user.email;
+      if (idx >= 0) {
+        vault[idx].passwordHash = hash;
+        vault[idx].mustChange = false;
+        if (updates.email) vault[idx].email = updates.email;
+      } else {
+        vault.push({ userId: req.user.userId, email: vaultEmail, passwordHash: hash, mustChange: false });
+      }
+      await saveVault(vault);
+    } else if (updates.email) {
+      const vault = await getVault();
+      const idx = vault.findIndex(v => v.userId === req.user!.userId);
+      if (idx >= 0) {
+        vault[idx].email = updates.email;
+        await saveVault(vault);
+      }
+    }
+
+    // Best-effort sync to Supabase Auth if user exists there
+    try {
+      const authUpdates: any = {};
+      if (updates.email) authUpdates.email = updates.email;
+      if (newPassword) authUpdates.password = newPassword;
+      if (updates.name) authUpdates.user_metadata = { name: updates.name };
+      if (Object.keys(authUpdates).length > 0) {
+        await supabase!.auth.admin.updateUserById(req.user.userId, authUpdates);
+      }
+    } catch (_) {}
 
     if (Object.keys(updates).length > 0) {
       updates.updated_at = new Date().toISOString();
@@ -384,23 +455,6 @@ router.put('/profile', async (req: AuthRequest, res: Response): Promise<void> =>
         res.status(400).json({ error: updateError.message });
         return;
       }
-    }
-
-    if (newPassword) {
-      if (typeof newPassword !== 'string' || newPassword.length < 8) {
-        res.status(400).json({ error: 'Password must be at least 8 characters' });
-        return;
-      }
-      const vault = await getVault();
-      const hash = await bcrypt.hash(newPassword, 10);
-      const idx = vault.findIndex(v => v.userId === req.user!.userId);
-      if (idx >= 0) {
-        vault[idx].passwordHash = hash;
-        vault[idx].mustChange = false;
-      } else {
-        vault.push({ userId: req.user.userId, email: req.user.email, passwordHash: hash, mustChange: false });
-      }
-      await saveVault(vault);
     }
 
     const updatedProfile = await loadStudentProfile(req.user.userId);

@@ -424,6 +424,144 @@ router.post('/change-password', auth_1.requireAuth, async (req, res) => {
         res.status(500).json({ error: 'Failed to update password' });
     }
 });
+// PUT /api/auth/profile
+router.put('/profile', auth_1.requireAuth, async (req, res) => {
+    if (!supabase_1.supabase || !req.user) {
+        res.status(503).json({ error: 'Database service unavailable' });
+        return;
+    }
+    const { name, email, avatar, profilePicture, newPassword } = req.body;
+    try {
+        const updates = {};
+        const cleanName = name !== undefined ? String(name).trim() : undefined;
+        const cleanAvatar = (avatar ?? profilePicture) !== undefined ? String(avatar ?? profilePicture).trim() : undefined;
+        const cleanEmail = email !== undefined ? String(email).trim().toLowerCase() : undefined;
+        if (cleanName && cleanName.length >= 2) {
+            updates.name = cleanName;
+        }
+        if (cleanAvatar !== undefined && cleanAvatar.length > 0) {
+            updates.avatar = cleanAvatar;
+        }
+        if (cleanEmail !== undefined && cleanEmail.length > 0) {
+            if (!cleanEmail.includes('@') || !cleanEmail.includes('.')) {
+                res.status(400).json({ error: 'Please enter a valid email address' });
+                return;
+            }
+            const { data: existingUser } = await supabase_1.supabase
+                .from('users')
+                .select('id')
+                .ilike('email', cleanEmail)
+                .neq('id', req.user.userId)
+                .maybeSingle();
+            if (existingUser) {
+                res.status(400).json({ error: 'This email is already registered to another account' });
+                return;
+            }
+            updates.email = cleanEmail;
+        }
+        if (newPassword) {
+            if (typeof newPassword !== 'string' || newPassword.length < 8) {
+                res.status(400).json({ error: 'Password must be at least 8 characters' });
+                return;
+            }
+            const vault = await (0, authVault_1.getVault)();
+            const hash = await bcryptjs_1.default.hash(newPassword, 10);
+            const idx = vault.findIndex(v => v.userId === req.user.userId);
+            const userEmail = updates.email || req.user.email;
+            if (idx >= 0) {
+                vault[idx].passwordHash = hash;
+                vault[idx].mustChange = false;
+                if (updates.email)
+                    vault[idx].email = updates.email;
+            }
+            else {
+                vault.push({ userId: req.user.userId, email: userEmail, passwordHash: hash, mustChange: false });
+            }
+            await (0, authVault_1.saveVault)(vault);
+        }
+        else if (updates.email) {
+            const vault = await (0, authVault_1.getVault)();
+            const idx = vault.findIndex(v => v.userId === req.user.userId);
+            if (idx >= 0) {
+                vault[idx].email = updates.email;
+                await (0, authVault_1.saveVault)(vault);
+            }
+        }
+        try {
+            const authUpdates = {};
+            if (updates.email)
+                authUpdates.email = updates.email;
+            if (newPassword)
+                authUpdates.password = newPassword;
+            if (updates.name)
+                authUpdates.user_metadata = { name: updates.name };
+            if (Object.keys(authUpdates).length > 0) {
+                await supabase_1.supabase.auth.admin.updateUserById(req.user.userId, authUpdates);
+            }
+        }
+        catch (_) { }
+        if (Object.keys(updates).length > 0) {
+            updates.updated_at = new Date().toISOString();
+            const { error: updateError } = await supabase_1.supabase
+                .from('users')
+                .update(updates)
+                .eq('id', req.user.userId);
+            if (updateError) {
+                res.status(400).json({ error: updateError.message });
+                return;
+            }
+        }
+        const { data: updatedUserData, error: fetchErr } = await supabase_1.supabase
+            .from('users')
+            .select('*')
+            .eq('id', req.user.userId)
+            .single();
+        if (fetchErr || !updatedUserData) {
+            res.status(500).json({ error: 'Failed to retrieve updated user profile' });
+            return;
+        }
+        const sectionIds = updatedUserData.section_id
+            ? updatedUserData.section_id.split(',').map((s) => s.trim()).filter(Boolean)
+            : [];
+        let firstName = updatedUserData.first_name || '';
+        let lastName = updatedUserData.last_name || '';
+        if (!firstName && !lastName && updatedUserData.name) {
+            const parts = String(updatedUserData.name).trim().split(/\s+/);
+            firstName = parts[0] || '';
+            lastName = parts.slice(1).join(' ') || '';
+        }
+        const studentId = updatedUserData.student_number || updatedUserData.id;
+        const finalAvatar = updatedUserData.avatar || ('https://api.dicebear.com/7.x/avataaars/svg?seed=' + encodeURIComponent(updatedUserData.name || 'user'));
+        const updatedUser = {
+            id: updatedUserData.id,
+            studentId: updatedUserData.role === 'student' ? studentId : undefined,
+            studentNumber: updatedUserData.student_number || undefined,
+            name: updatedUserData.name || (firstName + ' ' + lastName).trim(),
+            firstName,
+            lastName,
+            email: updatedUserData.email,
+            role: updatedUserData.role,
+            avatar: finalAvatar,
+            profilePicture: finalAvatar,
+            address: updatedUserData.address || undefined,
+            contactNumber: updatedUserData.contact_number || undefined,
+            sectionId: sectionIds[0] || undefined,
+            sectionIds,
+            title: updatedUserData.title || undefined,
+            department: updatedUserData.department || undefined,
+            mustChangePassword: updatedUserData.must_change_password || false,
+        };
+        res.json({
+            success: true,
+            message: 'Profile updated successfully',
+            user: updatedUser,
+        });
+    }
+    catch (err) {
+        console.error('Error updating user profile:', err);
+        res.status(500).json({ error: 'Failed to update user profile' });
+    }
+});
 // POST /api/auth/send-email-otp
 router.post('/send-email-otp', auth_1.requireAuth, async (req, res) => {
     if (!supabase_1.supabase || !req.user) {
