@@ -128,6 +128,8 @@ function mapSubject(subject: any, teacher?: any, template?: any) {
     templateName,
     schedule,
     matrix,
+    instructor: teacher?.name || 'Faculty Instructor',
+    teacherName: teacher?.name || 'Faculty Instructor',
     teacher: teacher ? { id: teacher.id, name: teacher.name } : undefined,
   };
 }
