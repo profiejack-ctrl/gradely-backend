@@ -14,6 +14,7 @@ import {
 } from '../lib/helpers';
 import { ScheduleSession, MatrixCategory, GradingPeriod } from '../types';
 import { getPaginationBounds, buildPaginationMeta } from '../lib/pagination';
+import { writeAudit } from '../lib/audit';
 
 const router = Router();
 router.use(requireAuth, requireFaculty);
@@ -743,7 +744,7 @@ router.get('/subjects/:subjectId/attendance', async (req: AuthRequest, res: Resp
         avatar: u.avatar || undefined,
       }));
 
-    // Fetch attendance records
+    // Fetch attendance records + summary of all recorded dates for this subject
     const attendanceQuery = supabase!
       .from('attendance_records')
       .select('id,subject_id,student_id,date,period,status,note')
@@ -753,7 +754,34 @@ router.get('/subjects/:subjectId/attendance', async (req: AuthRequest, res: Resp
     if (requestedDate) attendanceQuery.eq('date', requestedDate);
     if (requestedPeriod) attendanceQuery.eq('period', requestedPeriod);
 
-    const { data: records = [] } = await attendanceQuery;
+    const summaryQuery = supabase!
+      .from('attendance_records')
+      .select('date,period')
+      .eq('subject_id', subject.id)
+      .order('date', { ascending: false });
+
+    const [{ data: records = [] }, { data: summaryRows = [] }] = await Promise.all([
+      attendanceQuery,
+      summaryQuery,
+    ]);
+
+    const dateSummaryMap = new Map<string, { date: string; period: string; count: number }>();
+    for (const row of summaryRows || []) {
+      const d = String(row.date || '').trim();
+      if (!d) continue;
+      const existing = dateSummaryMap.get(d);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        dateSummaryMap.set(d, {
+          date: d,
+          period: String(row.period || 'prelim'),
+          count: 1,
+        });
+      }
+    }
+    const recordedDates = Array.from(dateSummaryMap.values()).sort((a, b) => b.date.localeCompare(a.date));
+
     const metrics = calculateAttendanceMetrics(records || []);
 
     res.json({
@@ -766,10 +794,105 @@ router.get('/subjects/:subjectId/attendance', async (req: AuthRequest, res: Resp
       metrics,
       students,
       records: records || [],
+      recordedDates,
     });
   } catch (err: any) {
     console.error('Faculty attendance error:', err);
     res.status(500).json({ error: 'Failed to load subject attendance' });
+  }
+});
+
+/**
+ * DELETE /api/faculty/subjects/:subjectId/attendance?date=YYYY-MM-DD(&period=prelim)
+ * Deletes an entire date's attendance roll call for one subject.
+ */
+router.delete('/subjects/:subjectId/attendance', async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!ensureConfigured(res)) return;
+  try {
+    const subject = await getAuthorizedSubject(req.user!.userId, req.user!.role, req.params.subjectId);
+    if (!subject) {
+      res.status(404).json({ error: 'Subject not found or not assigned to you' });
+      return;
+    }
+
+    const rawDate = typeof req.query.date === 'string'
+      ? req.query.date
+      : typeof req.body?.date === 'string'
+        ? req.body.date
+        : '';
+    const requestedDate = rawDate.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
+      res.status(400).json({ error: 'A valid date (YYYY-MM-DD) is required.' });
+      return;
+    }
+
+    const rawPeriod = typeof req.query.period === 'string'
+      ? req.query.period
+      : typeof req.body?.period === 'string'
+        ? req.body.period
+        : '';
+    const requestedPeriod = rawPeriod.trim() || undefined;
+
+    let findQuery = supabase!
+      .from('attendance_records')
+      .select('id,student_id,date,period,status')
+      .eq('subject_id', subject.id)
+      .eq('date', requestedDate);
+    if (requestedPeriod) {
+      findQuery = findQuery.eq('period', requestedPeriod);
+    }
+
+    const { data: existingRows = [], error: findError } = await findQuery;
+    if (findError) throw findError;
+
+    const deletedCount = (existingRows || []).length;
+    if (deletedCount === 0) {
+      res.json({
+        success: true,
+        subjectId: subject.id,
+        date: requestedDate,
+        period: requestedPeriod || null,
+        deletedCount: 0,
+      });
+      return;
+    }
+
+    let deleteQuery = supabase!
+      .from('attendance_records')
+      .delete()
+      .eq('subject_id', subject.id)
+      .eq('date', requestedDate);
+    if (requestedPeriod) {
+      deleteQuery = deleteQuery.eq('period', requestedPeriod);
+    }
+
+    const { error: deleteError } = await deleteQuery;
+    if (deleteError) throw deleteError;
+
+    writeAudit({
+      actorId: req.user?.userId,
+      actorRole: req.user?.role,
+      action: 'DELETE_ATTENDANCE_ROLL',
+      tableName: 'attendance_records',
+      metadata: {
+        subjectId: subject.id,
+        subjectCode: subject.code,
+        date: requestedDate,
+        period: requestedPeriod || 'all',
+        deletedCount,
+      },
+    }).catch(() => {});
+
+    res.json({
+      success: true,
+      subjectId: subject.id,
+      date: requestedDate,
+      period: requestedPeriod || null,
+      deletedCount,
+    });
+  } catch (err: any) {
+    console.error('Delete attendance roll error:', err);
+    res.status(500).json({ error: err?.message || 'Failed to delete attendance roll' });
   }
 });
 

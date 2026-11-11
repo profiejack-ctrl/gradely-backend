@@ -10,6 +10,7 @@ const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const authVault_1 = require("../lib/authVault");
 const helpers_1 = require("../lib/helpers");
 const pagination_1 = require("../lib/pagination");
+const audit_1 = require("../lib/audit");
 const router = (0, express_1.Router)();
 router.use(auth_1.requireAuth, auth_1.requireFaculty);
 function ensureConfigured(res) {
@@ -671,7 +672,7 @@ router.get('/subjects/:subjectId/attendance', async (req, res) => {
             studentNumber: u.student_number || undefined,
             avatar: u.avatar || undefined,
         }));
-        // Fetch attendance records
+        // Fetch attendance records + summary of all recorded dates for this subject
         const attendanceQuery = supabase_1.supabase
             .from('attendance_records')
             .select('id,subject_id,student_id,date,period,status,note')
@@ -681,7 +682,33 @@ router.get('/subjects/:subjectId/attendance', async (req, res) => {
             attendanceQuery.eq('date', requestedDate);
         if (requestedPeriod)
             attendanceQuery.eq('period', requestedPeriod);
-        const { data: records = [] } = await attendanceQuery;
+        const summaryQuery = supabase_1.supabase
+            .from('attendance_records')
+            .select('date,period')
+            .eq('subject_id', subject.id)
+            .order('date', { ascending: false });
+        const [{ data: records = [] }, { data: summaryRows = [] }] = await Promise.all([
+            attendanceQuery,
+            summaryQuery,
+        ]);
+        const dateSummaryMap = new Map();
+        for (const row of summaryRows || []) {
+            const d = String(row.date || '').trim();
+            if (!d)
+                continue;
+            const existing = dateSummaryMap.get(d);
+            if (existing) {
+                existing.count += 1;
+            }
+            else {
+                dateSummaryMap.set(d, {
+                    date: d,
+                    period: String(row.period || 'prelim'),
+                    count: 1,
+                });
+            }
+        }
+        const recordedDates = Array.from(dateSummaryMap.values()).sort((a, b) => b.date.localeCompare(a.date));
         const metrics = (0, helpers_1.calculateAttendanceMetrics)(records || []);
         res.json({
             subject: {
@@ -693,11 +720,100 @@ router.get('/subjects/:subjectId/attendance', async (req, res) => {
             metrics,
             students,
             records: records || [],
+            recordedDates,
         });
     }
     catch (err) {
         console.error('Faculty attendance error:', err);
         res.status(500).json({ error: 'Failed to load subject attendance' });
+    }
+});
+/**
+ * DELETE /api/faculty/subjects/:subjectId/attendance?date=YYYY-MM-DD(&period=prelim)
+ * Deletes an entire date's attendance roll call for one subject.
+ */
+router.delete('/subjects/:subjectId/attendance', async (req, res) => {
+    if (!ensureConfigured(res))
+        return;
+    try {
+        const subject = await getAuthorizedSubject(req.user.userId, req.user.role, req.params.subjectId);
+        if (!subject) {
+            res.status(404).json({ error: 'Subject not found or not assigned to you' });
+            return;
+        }
+        const rawDate = typeof req.query.date === 'string'
+            ? req.query.date
+            : typeof req.body?.date === 'string'
+                ? req.body.date
+                : '';
+        const requestedDate = rawDate.trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
+            res.status(400).json({ error: 'A valid date (YYYY-MM-DD) is required.' });
+            return;
+        }
+        const rawPeriod = typeof req.query.period === 'string'
+            ? req.query.period
+            : typeof req.body?.period === 'string'
+                ? req.body.period
+                : '';
+        const requestedPeriod = rawPeriod.trim() || undefined;
+        let findQuery = supabase_1.supabase
+            .from('attendance_records')
+            .select('id,student_id,date,period,status')
+            .eq('subject_id', subject.id)
+            .eq('date', requestedDate);
+        if (requestedPeriod) {
+            findQuery = findQuery.eq('period', requestedPeriod);
+        }
+        const { data: existingRows = [], error: findError } = await findQuery;
+        if (findError)
+            throw findError;
+        const deletedCount = (existingRows || []).length;
+        if (deletedCount === 0) {
+            res.json({
+                success: true,
+                subjectId: subject.id,
+                date: requestedDate,
+                period: requestedPeriod || null,
+                deletedCount: 0,
+            });
+            return;
+        }
+        let deleteQuery = supabase_1.supabase
+            .from('attendance_records')
+            .delete()
+            .eq('subject_id', subject.id)
+            .eq('date', requestedDate);
+        if (requestedPeriod) {
+            deleteQuery = deleteQuery.eq('period', requestedPeriod);
+        }
+        const { error: deleteError } = await deleteQuery;
+        if (deleteError)
+            throw deleteError;
+        (0, audit_1.writeAudit)({
+            actorId: req.user?.userId,
+            actorRole: req.user?.role,
+            action: 'DELETE_ATTENDANCE_ROLL',
+            tableName: 'attendance_records',
+            metadata: {
+                subjectId: subject.id,
+                subjectCode: subject.code,
+                date: requestedDate,
+                period: requestedPeriod || 'all',
+                deletedCount,
+            },
+        }).catch(() => { });
+        res.json({
+            success: true,
+            subjectId: subject.id,
+            date: requestedDate,
+            period: requestedPeriod || null,
+            deletedCount,
+        });
+    }
+    catch (err) {
+        console.error('Delete attendance roll error:', err);
+        res.status(500).json({ error: err?.message || 'Failed to delete attendance roll' });
     }
 });
 // =============================================================================
