@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { requireAuth, requireDean, requireFaculty, AuthRequest } from '../middleware/auth';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { pruneVaultToActiveUsers } from '../lib/authVault';
+import { getCalendarEvents } from '../lib/calendarEvents';
 import { getCourseCatalog, addCourseToCatalog, deleteCourseFromCatalog } from '../lib/courseCatalog';
 import { decodeSectionDescription, encodeSectionDescription, parseSectionIds, formatSectionIds, parseSchedule } from '../lib/helpers';
 import { writeAudit } from '../lib/audit';
@@ -655,12 +656,14 @@ router.get('/all', async (req: AuthRequest, res: Response) => {
       date: a.date, period: a.period, status: a.status, note: a.note || undefined,
     }));
 
+    const mappedEvents = await getCalendarEvents();
+
     const mappedHolidays = rawHolidays.map((h: any) => ({
       id: h.id, date: h.date, title: h.title, type: h.type,
       description: h.description || undefined,
     }));
 
-    res.json({ users: mappedUsers, sections: mappedSections, subjects: mappedSubjects, courses: catalogCourses, assessments: mappedAssessments, scores: mappedScores, attendance: mappedAttendance, matrixTemplates, holidays: mappedHolidays });
+    res.json({ users: mappedUsers, sections: mappedSections, subjects: mappedSubjects, courses: catalogCourses, assessments: mappedAssessments, scores: mappedScores, attendance: mappedAttendance, matrixTemplates, holidays: mappedHolidays, events: mappedEvents });
   } catch (err) {
     console.error('Failed to load all data:', err);
     res.status(500).json({ error: 'Failed to load data' });

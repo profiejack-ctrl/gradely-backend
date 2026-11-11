@@ -11,6 +11,7 @@ import auditRoutes from './routes/audit.routes';
 import attendanceRoutes from './routes/attendance.routes';
 import studentRoutes from './routes/student.routes';
 import facultyRoutes from './routes/faculty.routes';
+import eventsRoutes from './routes/events.routes';
 import { errorHandler } from './middleware/error';
 import { isSupabaseConfigured } from './lib/supabase';
 import swaggerUi from 'swagger-ui-express';
@@ -99,6 +100,7 @@ app.use('/api/data', dataRoutes);
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/faculty', facultyRoutes);
+app.use('/api/events', eventsRoutes);
 app.use('/api/teachers', teachersRoutes);
 app.use('/api/audit', auditRoutes);
 

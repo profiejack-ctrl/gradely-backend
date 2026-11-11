@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { requireAuth, requireStudent, AuthRequest } from '../middleware/auth';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { getCalendarEvents } from '../lib/calendarEvents';
 import { getVault, saveVault } from '../lib/authVault';
 import {
   parseSectionIds,
@@ -758,8 +759,11 @@ router.get('/dashboard', async (req: AuthRequest, res: Response): Promise<void> 
       };
     });
 
+    const calendarEvents = await getCalendarEvents();
+
     res.json({
       student: profile.student,
+      events: calendarEvents,
       overview: {
         enrolledSubjectsCount: subjects.length,
         totalUnits,
@@ -773,6 +777,21 @@ router.get('/dashboard', async (req: AuthRequest, res: Response): Promise<void> 
   } catch (error: any) {
     console.error('Student dashboard error:', error);
     res.status(500).json({ error: 'Failed to load student dashboard' });
+  }
+});
+
+
+/**
+ * GET /api/student/calendar
+ * Returns all upcoming academic events, examinations, holidays, and campus activities
+ */
+router.get('/calendar', async (_req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const events = await getCalendarEvents();
+    res.json({ events });
+  } catch (error: any) {
+    console.error('Student calendar error:', error);
+    res.status(500).json({ error: 'Failed to load calendar events' });
   }
 });
 
