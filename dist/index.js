@@ -16,6 +16,7 @@ const audit_routes_1 = __importDefault(require("./routes/audit.routes"));
 const attendance_routes_1 = __importDefault(require("./routes/attendance.routes"));
 const student_routes_1 = __importDefault(require("./routes/student.routes"));
 const faculty_routes_1 = __importDefault(require("./routes/faculty.routes"));
+const events_routes_1 = __importDefault(require("./routes/events.routes"));
 const error_1 = require("./middleware/error");
 const supabase_1 = require("./lib/supabase");
 const swagger_ui_express_1 = __importDefault(require("swagger-ui-express"));
@@ -99,6 +100,7 @@ app.use('/api/data', data_routes_1.default);
 app.use('/api/attendance', attendance_routes_1.default);
 app.use('/api/student', student_routes_1.default);
 app.use('/api/faculty', faculty_routes_1.default);
+app.use('/api/events', events_routes_1.default);
 app.use('/api/teachers', teachers_routes_1.default);
 app.use('/api/audit', audit_routes_1.default);
 // 404 handler for unknown routes

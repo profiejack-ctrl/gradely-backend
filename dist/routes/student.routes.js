@@ -7,6 +7,7 @@ const express_1 = require("express");
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const auth_1 = require("../middleware/auth");
 const supabase_1 = require("../lib/supabase");
+const calendarEvents_1 = require("../lib/calendarEvents");
 const authVault_1 = require("../lib/authVault");
 const helpers_1 = require("../lib/helpers");
 const router = (0, express_1.Router)();
@@ -668,8 +669,10 @@ router.get('/dashboard', async (req, res) => {
                 score: isGraded ? scoreRecord?.score : null,
             };
         });
+        const calendarEvents = await (0, calendarEvents_1.getCalendarEvents)();
         res.json({
             student: profile.student,
+            events: calendarEvents,
             overview: {
                 enrolledSubjectsCount: subjects.length,
                 totalUnits,
@@ -684,6 +687,20 @@ router.get('/dashboard', async (req, res) => {
     catch (error) {
         console.error('Student dashboard error:', error);
         res.status(500).json({ error: 'Failed to load student dashboard' });
+    }
+});
+/**
+ * GET /api/student/calendar
+ * Returns all upcoming academic events, examinations, holidays, and campus activities
+ */
+router.get('/calendar', async (_req, res) => {
+    try {
+        const events = await (0, calendarEvents_1.getCalendarEvents)();
+        res.json({ events });
+    }
+    catch (error) {
+        console.error('Student calendar error:', error);
+        res.status(500).json({ error: 'Failed to load calendar events' });
     }
 });
 /**

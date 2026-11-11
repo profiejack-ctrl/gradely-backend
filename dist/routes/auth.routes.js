@@ -23,7 +23,7 @@ function setSessionCookie(res, token) {
         httpOnly: true,
         secure: isProd,
         sameSite: isProd ? 'none' : 'lax',
-        maxAge: 2 * 60 * 60 * 1000,
+        maxAge: 10 * 365 * 24 * 60 * 60 * 1000,
         path: '/',
     });
 }
@@ -32,7 +32,8 @@ function setSessionCookie(res, token) {
 // ---------------------------------------------------------------------------
 function signToken(payload) {
     const secret = process.env.JWT_SECRET || 'gradely-production-jwt-vault-secret-key-2026';
-    const expiresIn = (process.env.JWT_EXPIRES_IN || '2h');
+    const rawExpires = process.env.JWT_EXPIRES_IN;
+    const expiresIn = (rawExpires && rawExpires !== '2h' && rawExpires !== '24h' ? rawExpires : '3650d');
     return jsonwebtoken_1.default.sign(payload, secret, { expiresIn });
 }
 // POST /api/auth/login

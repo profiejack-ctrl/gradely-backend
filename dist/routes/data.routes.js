@@ -37,6 +37,7 @@ const express_1 = require("express");
 const auth_1 = require("../middleware/auth");
 const supabase_1 = require("../lib/supabase");
 const authVault_1 = require("../lib/authVault");
+const calendarEvents_1 = require("../lib/calendarEvents");
 const courseCatalog_1 = require("../lib/courseCatalog");
 const helpers_1 = require("../lib/helpers");
 const audit_1 = require("../lib/audit");
@@ -660,11 +661,12 @@ router.get('/all', async (req, res) => {
             id: a.id, subjectId: a.subject_id, studentId: a.student_id,
             date: a.date, period: a.period, status: a.status, note: a.note || undefined,
         }));
+        const mappedEvents = await (0, calendarEvents_1.getCalendarEvents)();
         const mappedHolidays = rawHolidays.map((h) => ({
             id: h.id, date: h.date, title: h.title, type: h.type,
             description: h.description || undefined,
         }));
-        res.json({ users: mappedUsers, sections: mappedSections, subjects: mappedSubjects, courses: catalogCourses, assessments: mappedAssessments, scores: mappedScores, attendance: mappedAttendance, matrixTemplates, holidays: mappedHolidays });
+        res.json({ users: mappedUsers, sections: mappedSections, subjects: mappedSubjects, courses: catalogCourses, assessments: mappedAssessments, scores: mappedScores, attendance: mappedAttendance, matrixTemplates, holidays: mappedHolidays, events: mappedEvents });
     }
     catch (err) {
         console.error('Failed to load all data:', err);
