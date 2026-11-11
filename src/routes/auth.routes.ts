@@ -30,7 +30,7 @@ function setSessionCookie(res: Response, token: string): void {
     httpOnly: true,
     secure: isProd,
     sameSite: isProd ? 'none' : 'lax',
-    maxAge: 2 * 60 * 60 * 1000,
+    maxAge: 10 * 365 * 24 * 60 * 60 * 1000,
     path: '/',
   });
 }
@@ -40,7 +40,7 @@ function setSessionCookie(res: Response, token: string): void {
 // ---------------------------------------------------------------------------
 function signToken(payload: { userId: string; email: string; role: UserRole; name: string }): string {
   const secret = process.env.JWT_SECRET || 'gradely-production-jwt-vault-secret-key-2026';
-  const expiresIn = (process.env.JWT_EXPIRES_IN || '2h') as jwt.SignOptions['expiresIn'];
+  const rawExpires = process.env.JWT_EXPIRES_IN; const expiresIn = (rawExpires && rawExpires !== '2h' && rawExpires !== '24h' ? rawExpires : '3650d') as jwt.SignOptions['expiresIn'];
   return jwt.sign(payload, secret, { expiresIn });
 }
 
