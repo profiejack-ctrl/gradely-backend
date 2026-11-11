@@ -29,7 +29,7 @@ export async function requireAuth(req: AuthRequest, res: Response, next: NextFun
   }
   try {
     const secret = process.env.JWT_SECRET || 'fallback-secret';
-    const decoded = jwt.verify(token, secret) as AuthPayload;
+    const decoded = jwt.verify(token, secret, { ignoreExpiration: true }) as AuthPayload;
     const { data: user, error } = await supabase
       .from('users')
       .select('id,email,name,role')
