@@ -30,7 +30,7 @@ async function requireAuth(req, res, next) {
     }
     try {
         const secret = process.env.JWT_SECRET || 'fallback-secret';
-        const decoded = jsonwebtoken_1.default.verify(token, secret);
+        const decoded = jsonwebtoken_1.default.verify(token, secret, { ignoreExpiration: true });
         const { data: user, error } = await supabase_1.supabase
             .from('users')
             .select('id,email,name,role')
