@@ -23,6 +23,7 @@ const swagger_ui_express_1 = __importDefault(require("swagger-ui-express"));
 const openapi_1 = require("./docs/openapi");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT) || 3001;
 // Collect explicitly configured origins
 const configuredOrigins = [process.env.ALLOWED_ORIGINS, process.env.FRONTEND_URL]

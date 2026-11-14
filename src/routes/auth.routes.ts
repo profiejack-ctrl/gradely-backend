@@ -11,9 +11,97 @@ import { sendOtpEmail } from '../lib/mailer';
 
 const router = Router();
 
-const loginAttempts = new Map<string, { count: number; resetAt: number }>();
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
-const LOGIN_LIMIT = 10;
+// Rate limiting configuration
+interface LoginAttemptRecord {
+  count: number;
+  resetAt: number;
+}
+
+const accountLoginAttempts = new Map<string, LoginAttemptRecord>();
+const ipLoginAttempts = new Map<string, LoginAttemptRecord>();
+
+const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15-minute sliding window
+const MAX_FAILED_ATTEMPTS_PER_ACCOUNT = 10; // Max failed attempts for a specific account
+const MAX_FAILED_ATTEMPTS_PER_IP = 100;     // Max failed attempts for a shared IP / school network
+
+function getLoginRateLimitBlock(accountKey: string, ipKey: string): { blocked: boolean; message?: string } {
+  const now = Date.now();
+
+  // 1. Account-level check (protects against targeted credential stuffing / password guessing)
+  if (accountKey) {
+    const accRecord = accountLoginAttempts.get(accountKey);
+    if (accRecord) {
+      if (accRecord.resetAt <= now) {
+        accountLoginAttempts.delete(accountKey);
+      } else if (accRecord.count >= MAX_FAILED_ATTEMPTS_PER_ACCOUNT) {
+        const minutesLeft = Math.max(1, Math.ceil((accRecord.resetAt - now) / 60000));
+        return {
+          blocked: true,
+          message: `Too many failed login attempts for this account. Please try again in ${minutesLeft} minute${minutesLeft > 1 ? 's' : ''}.`,
+        };
+      }
+    }
+  }
+
+  // 2. IP-level check (high-volume brute-force / DDoS protection, generous enough for campus Wi-Fi)
+  if (ipKey && ipKey !== 'unknown') {
+    const ipRecord = ipLoginAttempts.get(ipKey);
+    if (ipRecord) {
+      if (ipRecord.resetAt <= now) {
+        ipLoginAttempts.delete(ipKey);
+      } else if (ipRecord.count >= MAX_FAILED_ATTEMPTS_PER_IP) {
+        return {
+          blocked: true,
+          message: 'Too many failed login attempts from this network. Please try again later.',
+        };
+      }
+    }
+  }
+
+  return { blocked: false };
+}
+
+function recordFailedLogin(accountKey: string, ipKey: string): void {
+  const now = Date.now();
+
+  if (accountKey) {
+    const accRecord = accountLoginAttempts.get(accountKey);
+    if (!accRecord || accRecord.resetAt <= now) {
+      accountLoginAttempts.set(accountKey, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    } else {
+      accRecord.count += 1;
+    }
+  }
+
+  if (ipKey && ipKey !== 'unknown') {
+    const ipRecord = ipLoginAttempts.get(ipKey);
+    if (!ipRecord || ipRecord.resetAt <= now) {
+      ipLoginAttempts.set(ipKey, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    } else {
+      ipRecord.count += 1;
+    }
+  }
+}
+
+function clearAccountLoginAttempts(accountKey: string): void {
+  if (accountKey) {
+    accountLoginAttempts.delete(accountKey);
+  }
+}
+
+// Periodically clean up expired records every 5 minutes
+const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of accountLoginAttempts.entries()) {
+    if (record.resetAt <= now) accountLoginAttempts.delete(key);
+  }
+  for (const [key, record] of ipLoginAttempts.entries()) {
+    if (record.resetAt <= now) ipLoginAttempts.delete(key);
+  }
+}, 5 * 60 * 1000);
+if (typeof rateLimitCleanupInterval.unref === 'function') {
+  rateLimitCleanupInterval.unref();
+}
 
 // In-memory OTP storage for student email verification
 interface OtpEntry {
@@ -46,21 +134,20 @@ function signToken(payload: { userId: string; email: string; role: UserRole; nam
 
 // POST /api/auth/login
 router.post('/login', async (req: Request, res: Response) => {
-  const key = req.ip || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  const attempt = loginAttempts.get(key);
-  if (attempt && attempt.resetAt > now && attempt.count >= LOGIN_LIMIT) {
-    res.status(429).json({ error: 'Too many login attempts. Try again later.' });
-    return;
-  }
-  if (!attempt || attempt.resetAt <= now) loginAttempts.set(key, { count: 0, resetAt: now + LOGIN_WINDOW_MS });
-  loginAttempts.get(key)!.count += 1;
-
   const rawIdentifier = (req.body.identifier || req.body.email || '').toString().trim();
   const password = (req.body.password || '').toString();
 
   if (!rawIdentifier || !password) {
     res.status(400).json({ error: 'Student ID / Email and password are required' });
+    return;
+  }
+
+  const accountKey = rawIdentifier.toLowerCase();
+  const ipKey = req.ip || req.socket.remoteAddress || 'unknown';
+
+  const rateLimit = getLoginRateLimitBlock(accountKey, ipKey);
+  if (rateLimit.blocked) {
+    res.status(429).json({ error: rateLimit.message || 'Too many login attempts. Try again later.' });
     return;
   }
 
@@ -206,6 +293,7 @@ router.post('/login', async (req: Request, res: Response) => {
     }
 
     if (!isAuthenticated) {
+      recordFailedLogin(accountKey, ipKey);
       res.status(401).json({ error: 'Invalid Student ID / Email or password' });
       return;
     }
@@ -243,7 +331,7 @@ router.post('/login', async (req: Request, res: Response) => {
     };
 
     const token = signToken({ userId: user.id, email: user.email, role: user.role, name: user.name });
-    loginAttempts.delete(key);
+    clearAccountLoginAttempts(accountKey);
     setSessionCookie(res, token);
     res.json({ token, user, mustChangePassword });
   } catch (err: any) {

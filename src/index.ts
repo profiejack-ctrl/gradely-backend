@@ -20,6 +20,7 @@ import { openapiDocument } from './docs/openapi';
 dotenv.config();
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT) || 3001;
 
 // Collect explicitly configured origins
